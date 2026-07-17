@@ -1,0 +1,15 @@
+# Generated outputs (regenerable by running the pipeline; several files
+# exceed GitHub's 100 MB limit) --------------------------------------------
+forecasts/
+midas_codes/forecasts/
+midas_codes/results/
+
+# Run logs and R plot spillover
+*.log
+Rplots.pdf
+
+# OS / editor noise
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/

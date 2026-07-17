@@ -1,0 +1,18 @@
+# Generated outputs (regenerable by running either pipeline; several of the
+# R-side coefficient CSVs exceed GitHub's 100 MB limit) ----------------------
+forecasts/
+results/
+
+# Run logs and R plot spillover
+*.log
+Rplots.pdf
+
+# Python noise
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
