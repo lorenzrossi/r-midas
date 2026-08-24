@@ -72,6 +72,7 @@ dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 FAMILIES     <- strsplit(Sys.getenv("FAMILIES", "r_midas,r_midas_extended"), ",")[[1]]
 TRAIL_DAYS   <- as.integer(Sys.getenv("TRAIL_DAYS",   "365"))
+TOP_N_SPECS  <- as.integer(Sys.getenv("TOP_N_SPECS",  "10"))
 MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "60"))
 TRIM         <- as.numeric(Sys.getenv("TRIM",         "0.2"))
 GR_MU        <- as.numeric(Sys.getenv("GR_MU",        "0.3"))
@@ -281,12 +282,14 @@ run_country <- function(country) {
       cfp <- file.path(FORECAST_DIR, sprintf("comb_%s_%s_h%02d.csv", fam, cc, h))
       write.csv(combo, cfp, row.names = FALSE)
 
-      # ---- best full-sample individual spec (ex post; look-ahead flag) ----
+      # ---- top-N full-sample individual specs (ex post; look-ahead flag) --
       full_rmse <- apply(Fm, 2, function(f) rmse_(f - y))
-      best_spec <- specs[which.min(full_rmse)]
+      ord <- order(full_rmse)
+      top_specs <- specs[ord[seq_len(min(TOP_N_SPECS, length(specs)))]]
+      best_spec <- top_specs[1L]
 
       models <- list()
-      models[[paste0(best_spec, "_expost")]] <- Fm[, best_spec]
+      for (s in top_specs) models[[paste0(s, "_expost")]] <- Fm[, s]
       models[["comb_eq"]]          <- comb_eq
       models[["comb_trim"]]        <- comb_trim
       models[["comb_invmse_fam"]]  <- comb_invmse_fam

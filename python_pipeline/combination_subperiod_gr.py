@@ -35,6 +35,7 @@ def _families():
 
 
 TRAIL_DAYS   = int(os.environ.get("TRAIL_DAYS", "365"))
+TOP_N_SPECS  = int(os.environ.get("TOP_N_SPECS", "10"))
 MIN_RESOLVED = int(os.environ.get("MIN_RESOLVED", "60"))
 TRIM         = float(os.environ.get("TRIM", "0.2"))
 GR_MU        = float(os.environ.get("GR_MU", "0.3"))
@@ -257,12 +258,14 @@ def run_country(country):
 
             full_rmse = {s: rmse_(F[:, j] - y2)
                          for j, s in enumerate(specs)}
-            best_spec = min(full_rmse, key=full_rmse.get)
-            models = {
-                f"{best_spec}_expost": F[:, specs.index(best_spec)],
+            top_specs = sorted(full_rmse, key=full_rmse.get)[:TOP_N_SPECS]
+            best_spec = top_specs[0]
+            models = {f"{s}_expost": F[:, specs.index(s)]
+                      for s in top_specs}
+            models.update({
                 "comb_eq": comb_eq, "comb_trim": comb_trim,
                 "comb_invmse_fam": comb_invmse_fam,
-                "comb_invmse": comb_invmse}
+                "comb_invmse": comb_invmse})
             for lbl, ym in models.items():
                 sum_rows += eval_model(lbl, fam, h, ym, y2, yb2, td2)
                 gr = gr_fluctuation(yb2 - y2, ym - y2, td2, h)
