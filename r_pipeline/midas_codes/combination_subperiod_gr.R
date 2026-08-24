@@ -12,8 +12,10 @@
 #
 # 1. FORECAST COMBINATION across the 256 specs (Bates-Granger 1969;
 #    Bordignon et al. 2013; averaging literature surveyed in Weron 2014):
-#      comb_eq      equal-weight mean of all spec forecasts
-#      comb_trim    20%-trimmed mean (robust to bad specs)
+#      comb_eq      equal-weight mean of all spec forecasts (family only)
+#      comb_trim    20%-trimmed mean (robust to bad specs; family only)
+#      comb_invmse  pool = specs + AR candidates (COMB_INCLUDE_AR, default
+#                   "ar_dum,ar_dum_gas"): adaptive fallback to the pure AR
 #      comb_invmse  inverse-MSE weights, computed in REAL TIME: at origin o
 #                   only forecast errors whose target date is <= o (i.e.
 #                   resolved errors, origin <= o - h) enter the MSE, over a
@@ -74,6 +76,19 @@ MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "60"))
 TRIM         <- as.numeric(Sys.getenv("TRIM",         "0.2"))
 GR_MU        <- as.numeric(Sys.getenv("GR_MU",        "0.3"))
 BENCH_COL    <- "ar_dum"
+
+# AR candidates added to the inverse-MSE combination POOL (not to the
+# benchmark, which stays ar_dum, and not to comb_eq / comb_trim, which remain
+# equal/trimmed averages of the R-MIDAS family only).  With the AR forecasts
+# in the pool, the real-time inverse-MSE weights migrate towards the pure AR
+# whenever the macro block turns harmful (e.g. the 2021-22 crisis) and back
+# when it pays off.  No look-ahead: weights use only resolved errors.
+# Set COMB_INCLUDE_AR="" to disable.
+COMB_INCLUDE_AR <- {
+  raw <- Sys.getenv("COMB_INCLUDE_AR", unset = "ar_dum,ar_dum_gas")
+  v <- trimws(strsplit(raw, ",")[[1]])
+  v[nzchar(v)]
+}
 
 PERIODS <- list(
   full   = c(as.Date("1900-01-01"), as.Date("2100-01-01")),
@@ -225,7 +240,10 @@ run_country <- function(country) {
       fc$origin_date <- as.Date(fc$origin_date)
       fc$target_date <- as.Date(fc$target_date)
 
-      mg <- merge(ar[, c("origin_date", "target_date", "y_actual", BENCH_COL)],
+      ar_pool <- intersect(COMB_INCLUDE_AR, names(ar))
+      ar_pool <- ar_pool[!grepl("__bc$", ar_pool)]
+      mg <- merge(ar[, unique(c("origin_date", "target_date", "y_actual",
+                                BENCH_COL, ar_pool))],
                   fc[, setdiff(names(fc), "y_actual")],
                   by = c("origin_date", "target_date"))
       mg <- mg[order(mg$origin_date), , drop = FALSE]
@@ -238,9 +256,14 @@ run_country <- function(country) {
       td <- mg$target_date
 
       # ---- combinations (real time) ----
+      # comb_eq / comb_trim: averages of the R-MIDAS family only.
+      # comb_invmse: pool = R-MIDAS specs + AR candidates, so the adaptive
+      # weights can fall back to the pure AR when the macro block hurts.
       comb_eq     <- rowMeans(Fm, na.rm = TRUE)
       comb_trim   <- apply(Fm, 1, mean, trim = TRIM, na.rm = TRUE)
-      comb_invmse <- combine_invmse(Fm, y, mg$origin_date, h)
+      F_pool <- if (length(ar_pool) > 0L)
+        cbind(Fm, as.matrix(mg[, ar_pool, drop = FALSE])) else Fm
+      comb_invmse <- combine_invmse(F_pool, y, mg$origin_date, h)
 
       combo <- data.frame(origin_date = mg$origin_date,
                           target_date = td, y_actual = y,

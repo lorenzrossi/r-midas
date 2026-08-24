@@ -40,6 +40,18 @@ TRIM         = float(os.environ.get("TRIM", "0.2"))
 GR_MU        = float(os.environ.get("GR_MU", "0.3"))
 BENCH_COL    = "ar_dum"
 
+
+def _comb_include_ar():
+    """AR candidates added to the inverse-MSE combination POOL (not to the
+    benchmark, which stays ar_dum, and not to comb_eq / comb_trim, which
+    remain family-only averages).  With the AR forecasts in the pool the
+    real-time inverse-MSE weights migrate towards the pure AR whenever the
+    macro block turns harmful and back when it pays off.  No look-ahead.
+    Set COMB_INCLUDE_AR="" to disable.  Read at call time so orchestrators
+    can set the env var after import."""
+    raw = os.environ.get("COMB_INCLUDE_AR", "ar_dum,ar_dum_gas")
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
 PERIODS = {
     "full":   ("1900-01-01", "2100-01-01"),
     "pre":    ("1900-01-01", "2020-12-31"),
@@ -195,7 +207,12 @@ def run_country(country):
                 print(f"  missing {fp} - skipped")
                 continue
             fc = pd.read_csv(fp, parse_dates=["origin_date", "target_date"])
-            mg = ar[["origin_date", "target_date", "y_actual", BENCH_COL]] \
+            ar_pool = [c for c in _comb_include_ar()
+                       if c in ar.columns and not c.endswith("__bc")]
+            ar_cols = list(dict.fromkeys(
+                ["origin_date", "target_date", "y_actual", BENCH_COL]
+                + ar_pool))
+            mg = ar[ar_cols] \
                 .merge(fc.drop(columns=["y_actual"]),
                        on=["origin_date", "target_date"]) \
                 .sort_values("origin_date")
@@ -208,9 +225,13 @@ def run_country(country):
             yb2 = mg[BENCH_COL].to_numpy(float)
             td2 = mg["target_date"].to_numpy()
 
+            # comb_eq / comb_trim: R-MIDAS family only.
+            # comb_invmse: pool = specs + AR candidates (adaptive fallback).
             comb_eq = np.nanmean(F, axis=1)
             comb_trim = trim_mean_rows(F)
-            comb_invmse = combine_invmse(F, y2,
+            F_pool = (np.hstack([F, mg[ar_pool].to_numpy(float)])
+                      if ar_pool else F)
+            comb_invmse = combine_invmse(F_pool, y2,
                                          mg["origin_date"].to_numpy(), h)
 
             combo = pd.DataFrame({

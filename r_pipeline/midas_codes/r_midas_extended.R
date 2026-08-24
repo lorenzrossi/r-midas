@@ -229,9 +229,17 @@ run_r_midas_extended_h <- function(country) {
         }
       }
 
+      # Low-frequency regressors must belong to the forecast-origin
+      # information set. Target-day calendar controls remain taken from
+      # t0 + 1 because they are known in advance.
+      lf_forecast <- if (length(lf_used) > 0L)
+        lf_mat[t0, lf_used, drop = FALSE]
+      else
+        NULL
+
       X_lin_row <- if (length(lf_used) > 0L)
         c(X_base[t0 + 1L, , drop = TRUE],
-          lf_mat[t0 + 1L, lf_used, drop = TRUE])
+          drop(lf_forecast))
       else
         X_base[t0 + 1L, , drop = TRUE]
       names(X_lin_row) <- c(base_cols, lf_used)
