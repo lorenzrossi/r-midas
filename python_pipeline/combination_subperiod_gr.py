@@ -226,19 +226,31 @@ def run_country(country):
             td2 = mg["target_date"].to_numpy()
 
             # comb_eq / comb_trim: R-MIDAS family only.
-            # comb_invmse: pool = specs + AR candidates (adaptive fallback).
+            # comb_invmse_fam: inverse-MSE combination of the family only.
+            # comb_invmse: TWO-STAGE.  Stage 1 = comb_invmse_fam.  Stage 2 =
+            # inverse-MSE over the SMALL pool {stage-1 combo, AR candidates};
+            # with 3 candidates the weights can concentrate on the AR when
+            # the macro block hurts (in a 258-strong pool the AR weight is
+            # diluted to ~2/258 and the fallback never bites).
             comb_eq = np.nanmean(F, axis=1)
             comb_trim = trim_mean_rows(F)
-            F_pool = (np.hstack([F, mg[ar_pool].to_numpy(float)])
-                      if ar_pool else F)
-            comb_invmse = combine_invmse(F_pool, y2,
-                                         mg["origin_date"].to_numpy(), h)
+            comb_invmse_fam = combine_invmse(F, y2,
+                                             mg["origin_date"].to_numpy(), h)
+            if ar_pool:
+                F_pool = np.column_stack(
+                    [comb_invmse_fam, mg[ar_pool].to_numpy(float)])
+                comb_invmse = combine_invmse(F_pool, y2,
+                                             mg["origin_date"].to_numpy(), h)
+            else:
+                comb_invmse = comb_invmse_fam
 
             combo = pd.DataFrame({
                 "origin_date": mg["origin_date"].dt.strftime("%Y-%m-%d"),
                 "target_date": mg["target_date"].dt.strftime("%Y-%m-%d"),
                 "y_actual": y2, "comb_eq": comb_eq,
-                "comb_trim": comb_trim, "comb_invmse": comb_invmse})
+                "comb_trim": comb_trim,
+                "comb_invmse_fam": comb_invmse_fam,
+                "comb_invmse": comb_invmse})
             cfp = os.path.join(cu.FORECAST_DIR,
                                f"comb_{fam}_{cc}_h{h:02d}.csv")
             combo.to_csv(cfp, index=False)
@@ -249,6 +261,7 @@ def run_country(country):
             models = {
                 f"{best_spec}_expost": F[:, specs.index(best_spec)],
                 "comb_eq": comb_eq, "comb_trim": comb_trim,
+                "comb_invmse_fam": comb_invmse_fam,
                 "comb_invmse": comb_invmse}
             for lbl, ym in models.items():
                 sum_rows += eval_model(lbl, fam, h, ym, y2, yb2, td2)

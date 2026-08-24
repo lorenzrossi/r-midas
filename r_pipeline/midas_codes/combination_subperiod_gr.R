@@ -257,17 +257,25 @@ run_country <- function(country) {
 
       # ---- combinations (real time) ----
       # comb_eq / comb_trim: averages of the R-MIDAS family only.
-      # comb_invmse: pool = R-MIDAS specs + AR candidates, so the adaptive
-      # weights can fall back to the pure AR when the macro block hurts.
+      # comb_invmse_fam: inverse-MSE combination of the family only.
+      # comb_invmse: TWO-STAGE.  Stage 1 = comb_invmse_fam.  Stage 2 =
+      # inverse-MSE over the SMALL pool {stage-1 combo, AR candidates}.
+      # With only 3 candidates the weights can concentrate on the AR when
+      # the macro block hurts; putting the AR directly into the 256-strong
+      # pool dilutes its weight to ~2/258 and has no effect.
       comb_eq     <- rowMeans(Fm, na.rm = TRUE)
       comb_trim   <- apply(Fm, 1, mean, trim = TRIM, na.rm = TRUE)
-      F_pool <- if (length(ar_pool) > 0L)
-        cbind(Fm, as.matrix(mg[, ar_pool, drop = FALSE])) else Fm
-      comb_invmse <- combine_invmse(F_pool, y, mg$origin_date, h)
+      comb_invmse_fam <- combine_invmse(Fm, y, mg$origin_date, h)
+      comb_invmse <- if (length(ar_pool) > 0L) {
+        F_pool <- cbind(comb_fam = comb_invmse_fam,
+                        as.matrix(mg[, ar_pool, drop = FALSE]))
+        combine_invmse(F_pool, y, mg$origin_date, h)
+      } else comb_invmse_fam
 
       combo <- data.frame(origin_date = mg$origin_date,
                           target_date = td, y_actual = y,
                           comb_eq = comb_eq, comb_trim = comb_trim,
+                          comb_invmse_fam = comb_invmse_fam,
                           comb_invmse = comb_invmse,
                           stringsAsFactors = FALSE)
       cfp <- file.path(FORECAST_DIR, sprintf("comb_%s_%s_h%02d.csv", fam, cc, h))
@@ -279,9 +287,10 @@ run_country <- function(country) {
 
       models <- list()
       models[[paste0(best_spec, "_expost")]] <- Fm[, best_spec]
-      models[["comb_eq"]]     <- comb_eq
-      models[["comb_trim"]]   <- comb_trim
-      models[["comb_invmse"]] <- comb_invmse
+      models[["comb_eq"]]          <- comb_eq
+      models[["comb_trim"]]        <- comb_trim
+      models[["comb_invmse_fam"]]  <- comb_invmse_fam
+      models[["comb_invmse"]]      <- comb_invmse
 
       for (lbl in names(models)) {
         sum_rows[[length(sum_rows) + 1L]] <-
