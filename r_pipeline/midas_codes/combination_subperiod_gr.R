@@ -51,8 +51,8 @@
 # ex post, look-ahead), and the three combinations (real-time, no look-ahead).
 #
 # Env knobs: COUNTRY_NAME ("Germany" | "Italy" | "ALL"), FAMILIES
-# (comma-separated, default "r_midas,r_midas_extended"), TRAIL_DAYS (365),
-# MIN_RESOLVED (60), TRIM (0.2), GR_MU (0.3).
+# (comma-separated, default "r_midas,r_midas_extended"), TRAIL_DAYS (90),
+# MIN_RESOLVED (30), TRIM (0.2), GR_MU (0.3).
 # =============================================================================
 
 args <- commandArgs(trailingOnly = FALSE)
@@ -71,9 +71,9 @@ RESULT_DIR   <- file.path(script_dir, "results")
 dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 FAMILIES     <- strsplit(Sys.getenv("FAMILIES", "r_midas,r_midas_extended"), ",")[[1]]
-TRAIL_DAYS   <- as.integer(Sys.getenv("TRAIL_DAYS",   "365"))
+TRAIL_DAYS   <- as.integer(Sys.getenv("TRAIL_DAYS",   "90"))
 TOP_N_SPECS  <- as.integer(Sys.getenv("TOP_N_SPECS",  "10"))
-MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "60"))
+MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "30"))
 TRIM         <- as.numeric(Sys.getenv("TRIM",         "0.2"))
 GR_MU        <- as.numeric(Sys.getenv("GR_MU",        "0.3"))
 BENCH_COL    <- "ar_dum"

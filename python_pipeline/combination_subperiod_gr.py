@@ -8,7 +8,7 @@
 #
 # 1. Combinations across the 256 specs: comb_eq (equal weights), comb_trim
 #    (20% trimmed mean), comb_invmse (real-time inverse-MSE, Bates-Granger,
-#    365-day trailing window of RESOLVED errors, min 60 resolved errors).
+#    90-day trailing window of RESOLVED errors, min 30 resolved errors).
 # 2. Subperiod evaluation vs ar_dum: full / pre (..2020) / crisis (2021-22) /
 #    post (2023..); RMSE-MAE-asinh ratios, DM-HLN on the full sample.
 # 3. Giacomini-Rossi (2010) two-sided fluctuation test (mu = 0.3), HAC
@@ -34,9 +34,9 @@ def _families():
             if f.strip()]
 
 
-TRAIL_DAYS   = int(os.environ.get("TRAIL_DAYS", "365"))
+TRAIL_DAYS   = int(os.environ.get("TRAIL_DAYS", "90"))
 TOP_N_SPECS  = int(os.environ.get("TOP_N_SPECS", "10"))
-MIN_RESOLVED = int(os.environ.get("MIN_RESOLVED", "60"))
+MIN_RESOLVED = int(os.environ.get("MIN_RESOLVED", "30"))
 TRIM         = float(os.environ.get("TRIM", "0.2"))
 GR_MU        = float(os.environ.get("GR_MU", "0.3"))
 BENCH_COL    = "ar_dum"
