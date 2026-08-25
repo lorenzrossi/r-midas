@@ -406,6 +406,23 @@ def dm_hln(e1, e2, h, loss="sqerr"):
 # -----------------------------------------------------------------------------
 # 7. CALENDAR REFRESH AT TARGET ROW  (= refresh_calendar_row in R)
 # -----------------------------------------------------------------------------
+def huber_weights(resid, k_mult=1.345):
+    """One-step Huber reweighting (RMIDAS_HUBER=1 in the runners).
+    w = 1 for |e| <= k, w = k/|e| beyond, with k = k_mult * MAD/0.6745
+    (robust scale; k_mult = 1.345 keeps 95% efficiency under Gaussian
+    errors).  Returns None when the robust scale is degenerate."""
+    resid = np.asarray(resid, float)
+    s = np.median(np.abs(resid - np.median(resid))) / 0.6745
+    if not np.isfinite(s) or s <= 0:
+        return None
+    k = k_mult * s
+    a = np.abs(resid)
+    w = np.ones_like(a)
+    big = a > k
+    w[big] = k / a[big]
+    return w
+
+
 WD_NAMES = ["wd_mon", "wd_tue", "wd_wed", "wd_thu", "wd_fri", "wd_sat"]
 
 

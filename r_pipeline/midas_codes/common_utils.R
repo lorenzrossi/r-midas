@@ -263,6 +263,26 @@ make_daily_lf <- function(daily_dates, monthly_df, lf_col, pub_lag,
 # (3650 x 14) blocks evaluated at every rolling origin.
 rows_all_finite <- function(M) rowSums(!is.finite(M)) == 0L
 
+# One-step Huber reweighting (used when RMIDAS_HUBER=1 in the runners).
+# Given the residuals of a first-stage fit, returns observation weights
+#   w_t = 1                 if |e_t| <= k
+#   w_t = k / |e_t|         if |e_t| >  k
+# with k = k_mult * MAD(resid)/0.6745 (robust scale; k_mult = 1.345 keeps
+# 95% efficiency under Gaussian errors).  The refit with these weights is
+# the standard one-step reweighted M-estimator: crisis-day residuals stop
+# dominating the coefficient estimates quadratically.  Returns NULL when
+# the robust scale is degenerate (all residuals ~ equal).
+huber_weights <- function(resid, k_mult = 1.345) {
+  s <- stats::median(abs(resid - stats::median(resid))) / 0.6745
+  if (!is.finite(s) || s <= 0) return(NULL)
+  k <- k_mult * s
+  a <- abs(resid)
+  w <- rep(1, length(resid))
+  big <- a > k
+  w[big] <- k / a[big]
+  w
+}
+
 shift_month <- function(d, k) {
   yrs <- as.integer(format(d, "%Y"))
   mos <- as.integer(format(d, "%m"))

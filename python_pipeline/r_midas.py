@@ -32,6 +32,17 @@ import common_utils as cu
 
 N_STARTS_R_MIDAS = 5
 
+# One-step Huber-reweighted estimation (robust to crisis-day outliers):
+# RMIDAS_HUBER=1 enables it; RMIDAS_HUBER_K sets the tuning constant
+# (default 1.345 = 95% Gaussian efficiency).  Identical to the R runner.
+HUBER_ON = os.environ.get("RMIDAS_HUBER", "0").lower() in ("1", "true", "yes")
+try:
+    HUBER_K = float(os.environ.get("RMIDAS_HUBER_K", "1.345"))
+    if not np.isfinite(HUBER_K) or HUBER_K <= 0:
+        HUBER_K = 1.345
+except ValueError:
+    HUBER_K = 1.345
+
 _CTX = {}
 
 
@@ -140,6 +151,28 @@ def fit_one_spec(si):
                                   lag_sets={"y_lags": cu.AR_LAGS})
         if fit is None:
             continue
+
+        # Optional one-step Huber reweighting (RMIDAS_HUBER=1): compute the
+        # stage-1 in-window residuals, build Huber weights (k = HUBER_K *
+        # MAD/0.6745) and refit ONCE with sqrt(w)-scaled rows (same WLS
+        # row-scaling trick as the discount).  Warm-started single start.
+        if HUBER_ON:
+            w_alm = cu.exp_almon_weights_j(cu.AR_LAGS,
+                                           fit["theta"]["y_lags"])
+            z_in = Zf @ w_alm
+            beta_vec = np.array([fit["beta_lin"][cn] for cn in lin_cols])
+            yhat_in = Xf @ beta_vec + fit["delta"]["y_lags"] * z_in
+            hw = cu.huber_weights(yf - yhat_in, HUBER_K)
+            if hw is not None:
+                swh = np.sqrt(hw)
+                fit2 = cu.fit_r_midas_fast(
+                    yf * swh, {"y_lags": Zf * swh[:, None]},
+                    Xf * swh[:, None], lin_cols,
+                    theta_init=fit["theta"]["y_lags"],
+                    optim_maxit=2000, optim_factr=5e8, n_starts=1,
+                    lag_sets={"y_lags": cu.AR_LAGS})
+                if fit2 is not None:
+                    fit = fit2
         theta_warm = fit["theta"]["y_lags"]
         sigma2_vec[oi] = fit["sigma2"]
 

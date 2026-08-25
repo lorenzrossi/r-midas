@@ -74,6 +74,14 @@ N_STARTS_R_MIDAS <- 5L
 # window are weighted lambda^(t0 - t) (weight 1 on the most recent day).
 # RMIDAS_DISCOUNT = 1 (default) disables it; e.g. 0.995 halves the weight
 # roughly every 139 days.
+# One-step Huber-reweighted estimation (robust to crisis-day outliers):
+# RMIDAS_HUBER=1 enables it; RMIDAS_HUBER_K sets the tuning constant
+# (default 1.345 = 95% Gaussian efficiency).  Applied identically to both
+# countries.  See huber_weights() in common_utils.R.
+HUBER_ON <- Sys.getenv("RMIDAS_HUBER", "0") %in% c("1", "TRUE", "true", "yes")
+HUBER_K  <- suppressWarnings(as.numeric(Sys.getenv("RMIDAS_HUBER_K", "1.345")))
+if (!is.finite(HUBER_K) || HUBER_K <= 0) HUBER_K <- 1.345
+
 DISCOUNT_LAMBDA <- suppressWarnings(as.numeric(Sys.getenv("RMIDAS_DISCOUNT", "1")))
 if (!is.finite(DISCOUNT_LAMBDA) || DISCOUNT_LAMBDA <= 0 || DISCOUNT_LAMBDA > 1)
   DISCOUNT_LAMBDA <- 1
@@ -238,6 +246,31 @@ run_r_midas <- function(country) {
                          n_starts    = N_STARTS_R_MIDAS,
                          lag_sets    = AR_LAG_SETS)
       if (is.null(fit)) next
+
+      # ---- optional one-step Huber reweighting (RMIDAS_HUBER=1) -----------
+      # Stage 1 = the fit above.  Compute its in-window residuals, build the
+      # Huber weights (k = RMIDAS_HUBER_K * MAD/0.6745), and refit ONCE with
+      # sqrt(w)-scaled rows (WLS = OLS on scaled data; same trick as the
+      # discount).  Warm-started single-start refit, so cost ~ one extra fit.
+      if (HUBER_ON) {
+        w_alm  <- exp_almon_weights_j(AR_LAGS, fit$theta["y_lags", ])
+        z_in   <- as.numeric(Z_fit$y_lags %*% w_alm)
+        yhat_in <- as.numeric(cbind(Xlin_fit, z_in) %*%
+                              c(fit$beta_lin, fit$delta["y_lags"]))
+        hw <- huber_weights(yfit - yhat_in, HUBER_K)
+        if (!is.null(hw)) {
+          swh <- sqrt(hw)
+          fit2 <- fit_r_midas(yfit * swh,
+                              lapply(Z_fit, function(M) M * swh),
+                              Xlin_fit * swh,
+                              theta_init  = as.numeric(t(fit$theta)),
+                              optim_maxit = 2000L,
+                              optim_factr = 5e8,
+                              n_starts    = 1L,
+                              lag_sets    = AR_LAG_SETS)
+          if (!is.null(fit2)) fit <- fit2
+        }
+      }
       theta_warm <- as.numeric(t(fit$theta))
       sigma2_vec[oi] <- fit$sigma2
 
