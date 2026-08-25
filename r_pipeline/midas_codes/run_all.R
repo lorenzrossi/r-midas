@@ -54,7 +54,7 @@ STAGE_FILES <- c(
   summary_all = "summary_table.R",
   combination = "combination_subperiod_gr.R"
 )
-DEFAULT_ORDER <- c("ar", "r_midas", "summary", "combination")
+DEFAULT_ORDER <- c("ar", "r_midas", "combination", "summary")
 
 stages_env <- Sys.getenv("STAGES", unset = "")
 order <- if (nzchar(stages_env)) {

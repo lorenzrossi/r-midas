@@ -22,6 +22,8 @@ FAMILY_PATTERNS = {
     "R_MIDAS":          "r_midas_{cc}_h{h:02d}.csv",
     "R_MIDAS_extended": "r_midas_extended_{cc}_h{h:02d}.csv",
     "R_MIDAS_surveys":  "r_midas_surveys_{cc}_h{h:02d}.csv",
+    # Real-time combinations from combination_subperiod_gr (run it first).
+    "COMB":             "comb_r_midas_{cc}_h{h:02d}.csv",
 }
 DICT_FILES = {
     "RU_MIDAS":         "ru_midas_spec_dictionary_{cc}.csv",
@@ -142,7 +144,9 @@ def process_country_h(cc, h):
         if len(common) == 0:
             continue
         bench_a = common["ar_dum"].to_numpy(float)
-        spec_cols = [c for c in mi.columns if c.startswith("spec_") and not c.endswith("__bc")]
+        prefix = "comb_" if fam == "COMB" else "spec_"
+        spec_cols = [c for c in mi.columns
+                     if c.startswith(prefix) and not c.endswith("__bc")]
         for sp in spec_cols:
             m = compute_metrics(common["y_actual"], common[sp], bench_a, h,
                                 _bc(common, f"{sp}__bc"),

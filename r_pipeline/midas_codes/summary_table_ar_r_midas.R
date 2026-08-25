@@ -154,7 +154,12 @@ compute_metrics <- function(y_actual, y_hat_test, y_hat_bench, h,
 }
 
 FAMILY_PATTERNS <- list(
-  R_MIDAS = function(cc, h) sprintf("r_midas_%s_h%02d.csv", cc, h)
+  R_MIDAS = function(cc, h) sprintf("r_midas_%s_h%02d.csv", cc, h),
+  # Real-time combinations written by combination_subperiod_gr.R (columns
+  # comb_eq / comb_trim / comb_invmse_fam / comb_invmse).  Run the
+  # combination stage BEFORE this summary so the files exist; the family is
+  # skipped silently when they do not.
+  COMB    = function(cc, h) sprintf("comb_r_midas_%s_h%02d.csv", cc, h)
 )
 
 DICT_FILES <- c(
@@ -196,7 +201,8 @@ process_country_h <- function(cc, h) {
     mi_a <- mi[match(common, as.character(mi$target_date)), , drop = FALSE]
     ar_a <- ar[match(common, as.character(ar$target_date)), , drop = FALSE]
     bench_a <- ar_a$ar_dum
-    spec_cols <- grep("^spec_", colnames(mi_a), value = TRUE)
+    col_prefix <- if (fam == "COMB") "^comb_" else "^spec_"
+    spec_cols <- grep(col_prefix, colnames(mi_a), value = TRUE)
     spec_cols <- spec_cols[!grepl("__bc$", spec_cols)]
     for (sp in spec_cols) {
       m <- compute_metrics(mi_a$y_actual, mi_a[[sp]], bench_a, h,

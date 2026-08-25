@@ -38,8 +38,8 @@ def _load_stage(stage):
 # Current focus: AR + updated R-MIDAS only (other stages via STAGES env var).
 DEFAULT_ORDER = ["ar",
                  "r_midas",
-                 "summary",
-                 "combination"]
+                 "combination",
+                 "summary"]
 
 
 def main():

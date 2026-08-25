@@ -155,7 +155,9 @@ FAMILY_PATTERNS <- list(
   # Legacy-style R-MIDAS — same model as R_MIDAS but legacy NLS code path
   # (inline concentrated_sse / fit_window_model, optim_maxit=3000, factr=1e7,
   # lm.fit OLS at theta_hat).  Cross-implementation validation of R_MIDAS.
-  R_MIDAS_legacy   = function(cc, h) sprintf("r_midas_legacy_%s_h%02d.csv",   cc, h)
+  R_MIDAS_legacy   = function(cc, h) sprintf("r_midas_legacy_%s_h%02d.csv",   cc, h),
+  # Real-time combinations from combination_subperiod_gr.R (run it first).
+  COMB             = function(cc, h) sprintf("comb_r_midas_%s_h%02d.csv",     cc, h)
 )
 
 process_country_h <- function(cc, h) {
@@ -215,7 +217,8 @@ process_country_h <- function(cc, h) {
     mi_a <- mi[match(common, as.character(mi$target_date)), , drop = FALSE]
     ar_a <- ar[match(common, as.character(ar$target_date)), , drop = FALSE]
     bench_a <- ar_a$ar_dum
-    spec_cols <- grep("^spec_", colnames(mi_a), value = TRUE)
+    col_prefix <- if (fam == "COMB") "^comb_" else "^spec_"
+    spec_cols <- grep(col_prefix, colnames(mi_a), value = TRUE)
     spec_cols <- spec_cols[!grepl("__bc$", spec_cols)]
     for (sp in spec_cols) {
       m <- compute_metrics(mi_a$y_actual, mi_a[[sp]], bench_a, h,
