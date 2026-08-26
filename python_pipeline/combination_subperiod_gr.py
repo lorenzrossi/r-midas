@@ -10,8 +10,11 @@
 #    (20% trimmed mean), comb_invmse (real-time inverse-MSE, Bates-Granger,
 #    90-day trailing window of RESOLVED errors, min 30 resolved errors).
 # 2. Subperiod evaluation vs ar_dum: full / pre (..2020) / crisis (2021-22) /
-#    post (2023..); RMSE-MAE-asinh ratios, DM-HLN on the full sample.
-# 3. Giacomini-Rossi (2010) two-sided fluctuation test (mu = 0.3), HAC
+#    post (2023..); RMSE-MAE-asinh ratios, DM-HLN in every period
+#    (minimum sample length max(30, 10*h)).
+# 3. Giacomini-Rossi (2010) two-sided fluctuation test (mu = 0.3):
+#    TRAILING windows, each statistic timestamped by the window END
+#    date (instability dates = window endpoints, not centres); HAC
 #    variance with rectangular kernel truncated at h-1.
 #    NOTE: critical values transcribed from GR (2010) Table 1; verify against
 #    the published table before final use in the paper.
@@ -173,16 +176,25 @@ def eval_model(label, family, h, yhat, y, ybench, tdates):
             continue
         # DM-HLN computed within EVERY period (unconditional test on the
         # subsample, same h-1 HAC truncation); GR covers time variation.
-        dm_lvl = cu.dm_hln(e_m[ok_l], e_b[ok_l], h)
+        # Minimum sample length (referee point 10): overlapping h-step
+        # errors make short-subsample HAC variances unreliable.
+        n_min_dm = max(30, 10 * h)
+        dm_lvl = (cu.dm_hln(e_m[ok_l], e_b[ok_l], h)
+                  if ok_l.sum() >= n_min_dm
+                  else {"stat": np.nan, "pvalue": np.nan})
         dm_as = (cu.dm_hln(ea_m[ok_a], ea_b[ok_a], h)
-                 if ok_a.any() else {"stat": np.nan, "pvalue": np.nan})
+                 if ok_a.sum() >= n_min_dm
+                 else {"stat": np.nan, "pvalue": np.nan})
         rows.append({
             "family": family, "model": label, "h": h, "period": pn,
             "n": int(np.sum(ok_l)),
             "rmse": rmse_(e_m[ok_l]), "rmse_bench": rmse_(e_b[ok_l]),
             "rmse_ratio": rmse_(e_m[ok_l]) / rmse_(e_b[ok_l]),
             "mae_ratio": mae_(e_m[ok_l]) / mae_(e_b[ok_l]),
-            "rmse_ratio_asinh": rmse_(ea_m[ok_a]) / rmse_(ea_b[ok_a]),
+            # Explicit guard (referee point 7): NA when no valid pair of
+            # transformed-scale observations remains in the subsample.
+            "rmse_ratio_asinh": (rmse_(ea_m[ok_a]) / rmse_(ea_b[ok_a])
+                                 if ok_a.any() else np.nan),
             "dm_stat": dm_lvl["stat"], "dm_pval": dm_lvl["pvalue"],
             "dm_stat_asinh": dm_as["stat"], "dm_pval_asinh": dm_as["pvalue"],
         })

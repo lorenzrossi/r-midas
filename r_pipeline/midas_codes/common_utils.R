@@ -29,7 +29,12 @@
 #   1 holiday dummy (national holidays per country, fixed + Easter-derived
 #                    movable feasts)
 #
-# Publication lags:
+# Low-frequency availability (RELEASE-AWARE; see make_daily_lf below):
+# each monthly value becomes usable on its release date (exact
+# <var>_release_date column when present, conventional schedule otherwise)
+# and is carried forward until the next release.  The pub_lag constants
+# below are retained ONLY for the legacy calendar-shift mode
+# (LF_RELEASE_MODE=calendar_lag) and for the survey/IPI distinction:
 #   IPI                       : pub_lag = 2 months (Eurostat ~T-2 release)
 #   PMI / IFO BCI / ISTAT BCI : pub_lag = 1 month  (released end of ref. month)
 #
@@ -262,6 +267,31 @@ make_daily_lf <- function(daily_dates, monthly_df, lf_col, pub_lag,
 # Replaces apply(M, 1, function(r) all(is.finite(r))), which is slow on
 # (3650 x 14) blocks evaluated at every rolling origin.
 rows_all_finite <- function(M) rowSums(!is.finite(M)) == 0L
+
+# Horizon-specific forecast-error variance of an ITERATED linear AR model
+# (referee point: the inverse-asinh bias correction must use the h-step
+# forecast-error variance, not the one-step disturbance variance).
+# For the fitted dynamics  y_t = ... + sum_j phi_j y_{t-j} + eps,  eps ~
+# (0, sigma2), the iterated h-step error is  e_h = sum_{s=0}^{h-1} psi_s
+# eps_{t+h-s}  with MA weights  psi_0 = 1,  psi_s = sum_j phi_j psi_{s-j},
+# so  Var(e_h) = sigma2 * sum_{s=0}^{h-1} psi_s^2.  Exact under the fitted
+# linear dynamics with frozen exogenous terms; ignores parameter
+# uncertainty (standard).  Returns the vector (sigma2_1, ..., sigma2_hmax).
+#   ar_lags : integer lag positions (e.g. c(1, 2, 3, 7))
+#   phi     : AR coefficients at those positions (same order)
+#   sigma2  : one-step disturbance variance
+iterated_error_variance <- function(ar_lags, phi, sigma2, h_max = H_MAX) {
+  psi <- c(1, numeric(h_max - 1L))            # psi[s+1] = psi_s, psi_0 = 1
+  for (s in seq_len(h_max - 1L)) {
+    acc <- 0
+    for (jj in seq_along(ar_lags)) {
+      L <- ar_lags[jj]
+      if (L <= s) acc <- acc + phi[jj] * psi[s - L + 1L]
+    }
+    psi[s + 1L] <- acc
+  }
+  sigma2 * cumsum(psi^2)                      # sigma2_h for h = 1..h_max
+}
 
 # One-step Huber reweighting (used when RMIDAS_HUBER=1 in the runners).
 # Given the residuals of a first-stage fit, returns observation weights

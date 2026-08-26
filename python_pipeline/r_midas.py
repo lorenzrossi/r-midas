@@ -13,8 +13,9 @@
 # the previous origin plus deterministic canonical shape restarts (n_starts
 # = 5 like the R script; capped at 1 + 5 shapes).
 #
-# Iterated multi-step (option c.1): AR-Almon feedback; LF and HF lag-1
-# columns frozen at row (origin + 1); calendar refreshed at the target row.
+# Iterated multi-step (option c.1): AR-Almon feedback; LF columns frozen
+# at the ORIGIN row t0 (latest released value); fuel lag-1 columns frozen at
+# row origin+1 (= fuel price observed at t0); calendar refreshed at target.
 #
 # Outputs (same layout as the R script):
 #   forecasts/r_midas_<cc>_h<h>.csv
@@ -74,8 +75,10 @@ def _build_context(country):
     base_cols = ["intercept"] + cal_cols
     hol_set = cu.country_holidays(dates.dt.year.unique(), country)
 
+    # Max lag actually used: Almon block on {1,2,3,7} + fuel lag 1 -> 7
+    # pre-sample days suffice (referee point 11; was 14 via Q_HF).
     origins = cu.make_origins(n, cu.WINDOW_DAYS,
-                              pre_lag_max=max(cu.AR_LAGS + [cu.Q_HF]),
+                              pre_lag_max=max(cu.AR_LAGS),
                               h_max=cu.H_MAX)
     masks = cu.build_spec_grid(cu.HF_CANDIDATES, lf_names, cu.spec_limit())
 
@@ -108,7 +111,8 @@ def fit_one_spec(si):
     coef_cols = ["delta_y"] + lf_names
     yhat_mat = np.full((n_orig, cu.H_MAX), np.nan)
     coef_mat = np.full((n_orig, len(coef_cols)), np.nan)
-    sigma2_vec = np.full(n_orig, np.nan)
+    # Horizon-specific forecast-error variances (referee point 3).
+    sigma2_mat = np.full((n_orig, cu.H_MAX), np.nan)
     theta_warm = None
 
     lin_cols = list(c["base_cols"]) + lf_used + \
@@ -136,6 +140,9 @@ def fit_one_spec(si):
         Xf = X_lin[keep]
         yf = ywin[keep]
         Zf = Zwin[keep]
+        # Unweighted copies: the bias-correction variance is recomputed on
+        # these raw rows after the (possibly weighted) fit (referee point 4).
+        Xf_raw, yf_raw, Zf_raw = Xf, yf, Zf
         if c["discount"] < 1:
             sw = np.sqrt(c["discount"] ** (t0 - np.arange(lo, t0 + 1)))[keep]
             Xf = Xf * sw[:, None]
@@ -152,7 +159,10 @@ def fit_one_spec(si):
         if fit is None:
             continue
 
-        # Optional one-step Huber reweighting (RMIDAS_HUBER=1): compute the
+        # Optional one-step Huber reweighting (RMIDAS_HUBER=1).  NOTE:
+        # when RMIDAS_DISCOUNT is also active the Huber residuals are
+        # computed on the DISCOUNTED observations (state explicitly in
+        # the methodology if both are enabled).  Compute the
         # stage-1 in-window residuals, build Huber weights (k = HUBER_K *
         # MAD/0.6745) and refit ONCE with sqrt(w)-scaled rows (same WLS
         # row-scaling trick as the discount).  Warm-started single start.
@@ -174,7 +184,18 @@ def fit_one_spec(si):
                 if fit2 is not None:
                     fit = fit2
         theta_warm = fit["theta"]["y_lags"]
-        sigma2_vec[oi] = fit["sigma2"]
+
+        # Bias-correction variance (referee points 3 and 4): one-step
+        # residual variance on the ORIGINAL unweighted rows, propagated to
+        # each horizon through the fitted AR dynamics phi_j = delta*b(j).
+        w_bc = cu.exp_almon_weights_j(cu.AR_LAGS, fit["theta"]["y_lags"])
+        z_bc = Zf_raw @ w_bc
+        beta_v = np.array([fit["beta_lin"][cn] for cn in lin_cols])
+        res_bc = yf_raw - (Xf_raw @ beta_v
+                           + fit["delta"]["y_lags"] * z_bc)
+        phi_bc = fit["delta"]["y_lags"] * w_bc
+        sigma2_mat[oi] = cu.iterated_error_variance(
+            cu.AR_LAGS, phi_bc, float(np.mean(res_bc**2)), cu.H_MAX)
 
         coef_mat[oi, 0] = fit["delta"]["y_lags"]
         for v in lf_used:
@@ -201,7 +222,7 @@ def fit_one_spec(si):
             ar_block_name="y_lags", hf_block_names=(),
             h_max=cu.H_MAX, holiday_set=c["hol_set"],
             lag_sets={"y_lags": cu.AR_LAGS})
-    return si, yhat_mat, coef_mat, sigma2_vec
+    return si, yhat_mat, coef_mat, sigma2_mat
 
 
 def run_country(country):
@@ -246,7 +267,8 @@ def run_country(country):
             mu = results[si][0][:, h - 1]
             s2 = results[si][2]
             cols[sid] = np.sinh(mu)
-            cols[f"{sid}__bc"] = np.sinh(mu) * np.exp(s2 / 2)
+            # Bias correction with the h-step error variance (column h-1).
+            cols[f"{sid}__bc"] = np.sinh(mu) * np.exp(s2[:, h - 1] / 2)
         fp = os.path.join(cu.FORECAST_DIR, f"r_midas_{cc}_h{h:02d}.csv")
         nrows = cu.write_forecast_csv(fp, c["dates"], origins, h, y_lvl, cols)
         print(f"  wrote {fp}  (rows = {nrows})")

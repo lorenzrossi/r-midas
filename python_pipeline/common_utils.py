@@ -406,6 +406,24 @@ def dm_hln(e1, e2, h, loss="sqerr"):
 # -----------------------------------------------------------------------------
 # 7. CALENDAR REFRESH AT TARGET ROW  (= refresh_calendar_row in R)
 # -----------------------------------------------------------------------------
+def iterated_error_variance(ar_lags, phi, sigma2, h_max=H_MAX):
+    """Horizon-specific forecast-error variance of an ITERATED linear AR
+    (referee point: the inverse-asinh bias correction must use the h-step
+    forecast-error variance, not the one-step disturbance variance).
+    psi_0 = 1, psi_s = sum_j phi_j psi_{s-j};
+    Var(e_h) = sigma2 * sum_{s=0}^{h-1} psi_s^2.
+    Exact under the fitted linear dynamics with frozen exogenous terms."""
+    psi = np.zeros(h_max)
+    psi[0] = 1.0
+    for s in range(1, h_max):
+        acc = 0.0
+        for L, p in zip(ar_lags, phi):
+            if L <= s:
+                acc += p * psi[s - L]
+        psi[s] = acc
+    return sigma2 * np.cumsum(psi**2)      # sigma2_h for h = 1..h_max
+
+
 def huber_weights(resid, k_mult=1.345):
     """One-step Huber reweighting (RMIDAS_HUBER=1 in the runners).
     w = 1 for |e| <= k, w = k/|e| beyond, with k = k_mult * MAD/0.6745

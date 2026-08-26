@@ -32,7 +32,9 @@
 #
 # Iterated multi-step (option c.1):
 #   * y AR-Almon: history_y_aug fed back through fixed θ_y Almon weights
-#   * LF and HF lag1 columns: FROZEN at row (origin + 1)
+#   * LF columns: FROZEN at the ORIGIN row t0 (latest released value);
+#     HF fuel lag1 columns: FROZEN at row (origin + 1), i.e. the fuel
+#     price observed at the origin
 #   * Calendar dummies (weekday, month, holiday): REFRESHED at target row
 #
 # OUTPUTS:
@@ -168,7 +170,11 @@ run_r_midas <- function(country) {
   cat(sprintf("  wrote %s  (specs = %d)\n", dict_path, nrow(dict)))
 
   origins <- make_origins(n, WINDOW_DAYS,
-                          pre_lag_max = max(c(AR_LAGS, Q_HF, Q_AR)),
+                          # Max lag actually used by this model: the Almon
+                          # block runs on lags {1,2,3,7} and the fuel columns
+                          # on lag 1, so 7 pre-sample days suffice (referee
+                          # point 11; was 14 via Q_HF).
+                          pre_lag_max = max(AR_LAGS),
                           h_max = H_MAX)
   n_orig <- length(origins)
   cat(sprintf("  rolling origins: %d (from %s to %s)\n",
@@ -190,7 +196,9 @@ run_r_midas <- function(country) {
     yhat_mat   <- matrix(NA_real_, n_orig, H_MAX)
     coef_mat   <- matrix(NA_real_, n_orig, length(coef_cols),
                          dimnames = list(NULL, coef_cols))
-    sigma2_vec <- rep(NA_real_, n_orig)
+    # Horizon-specific forecast-error variances (referee point 3): row =
+    # origin, column = step 1..H_MAX; filled via iterated_error_variance().
+    sigma2_mat <- matrix(NA_real_, n_orig, H_MAX)
 
     # ==== MAIN ROLLING-ORIGIN LOOP =========================================
     # One iteration = one forecast origin t0: estimate the model on the
@@ -240,6 +248,13 @@ run_r_midas <- function(country) {
       Xlin_fit <- X_lin[keep_train, , drop = FALSE]
       yfit     <- ywin[keep_train]
       Z_fit    <- list(y_lags = Z_list$y_lags[keep_train, , drop = FALSE])
+      # Keep UNweighted copies: the bias-correction variance must be the
+      # innovation variance of the original transformed-price process, so it
+      # is recomputed on these raw rows after the (possibly weighted)
+      # estimation (referee point 4).
+      Xlin_raw <- Xlin_fit
+      yfit_raw <- yfit
+      Zraw     <- Z_fit$y_lags
 
       # Discounted (weighted) LS via row scaling: WLS = OLS on sqrt-weighted
       # rows.  Coefficients are then used on UNscaled forecast rows as usual.
@@ -270,6 +285,10 @@ run_r_midas <- function(country) {
       if (is.null(fit)) next               # rank-deficient / degenerate window
 
       # ---- optional one-step Huber reweighting (RMIDAS_HUBER=1) -----------
+      # NOTE: when RMIDAS_DISCOUNT is also active, the Huber residuals are
+      # computed on the DISCOUNTED observations (robustness applied after
+      # discounting) - state this explicitly in the methodology if both
+      # options are enabled together.
       # Stage 1 = the fit above.  Compute its in-window residuals, build the
       # Huber weights (k = RMIDAS_HUBER_K * MAD/0.6745), and refit ONCE with
       # sqrt(w)-scaled rows (WLS = OLS on scaled data; same trick as the
@@ -294,9 +313,21 @@ run_r_midas <- function(country) {
         }
       }
       theta_warm <- as.numeric(t(fit$theta))   # cache theta for next origin
-      # In-window residual variance sigma^2_t: used later for the feasible
-      # inverse-asinh bias correction  sinh(mu)*exp(sigma^2/2)  (__bc cols).
-      sigma2_vec[oi] <- fit$sigma2
+
+      # ---- bias-correction variance (referee points 3 and 4) --------------
+      # (a) Recompute the one-step residual variance on the ORIGINAL,
+      #     unweighted observations at the final coefficients (identical to
+      #     fit$sigma2 when discounting and Huber are off).
+      w_bc   <- exp_almon_weights_j(AR_LAGS, fit$theta["y_lags", ])
+      z_bc   <- as.numeric(Zraw %*% w_bc)
+      res_bc <- yfit_raw - as.numeric(cbind(Xlin_raw, z_bc) %*%
+                                      c(fit$beta_lin, fit$delta["y_lags"]))
+      # (b) Propagate to each horizon through the fitted AR dynamics: the
+      #     implied AR coefficients are phi_j = delta * b(j; theta_hat) at
+      #     lags j in {1,2,3,7}; sigma2_h = sigma2 * sum_{s<h} psi_s^2.
+      phi_bc <- as.numeric(fit$delta["y_lags"]) * w_bc
+      sigma2_mat[oi, ] <- iterated_error_variance(AR_LAGS, phi_bc,
+                                                  mean(res_bc^2), H_MAX)
 
       # Record the rolling coefficients: delta = total AR loading (the Almon
       # weights sum to 1, so delta is the sum of the four implied AR
@@ -359,7 +390,7 @@ run_r_midas <- function(country) {
         lag_sets        = AR_LAG_SETS
       )
     }
-    list(yhat_mat = yhat_mat, coef_mat = coef_mat, sigma2 = sigma2_vec)
+    list(yhat_mat = yhat_mat, coef_mat = coef_mat, sigma2 = sigma2_mat)
   }
 
   t_start <- Sys.time()
@@ -377,7 +408,7 @@ run_r_midas <- function(country) {
     # variance estimated inside that origin's rolling estimation window.
     yhat_bc_mat <- vapply(seq_along(spec_ids), function(si) {
       mu <- spec_results[[si]]$yhat_mat[, h]
-      s2 <- spec_results[[si]]$sigma2
+      s2 <- spec_results[[si]]$sigma2[, h]   # h-step error variance
       sinh(mu) * exp(s2 / 2)
     }, numeric(n_orig))
     colnames(yhat_bc_mat) <- paste0(spec_ids, "__bc")

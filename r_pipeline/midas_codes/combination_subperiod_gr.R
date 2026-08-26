@@ -37,7 +37,8 @@
 # 3. GIACOMINI-ROSSI (2010, J. Applied Econometrics) FLUCTUATION TEST of the
 #    model against the AR benchmark: rolling sums of the squared-error loss
 #    differential d_t = e_bench^2 - e_model^2 (positive = model better) over
-#    a centered fraction mu = 0.3 of the sample, studentised with the same
+#    a TRAILING window of a fraction mu = 0.3 of the sample (each statistic
+#    is timestamped by the window END date), studentised with the same
 #    rectangular-kernel HAC variance (truncation h-1) used in dm_hln.
 #    Output: results/gr_fluctuation_<cc>.csv with the max and min of the
 #    fluctuation statistic, the two-sided critical values, and the dates at
@@ -204,9 +205,16 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
     # subsample it is the unconditional equal-accuracy test restricted to
     # those target dates, with the same h-1 HAC truncation.  The GR test
     # remains the instrument for the full time-varying picture.
-    dm_lvl <- dm_hln(e_m[ok_lvl], e_b[ok_lvl], h)
-    dm_as  <- if (any(ok_as)) dm_hln(ea_m[ok_as], ea_b[ok_as], h) else
-                list(stat = NA_real_, pvalue = NA_real_)
+    # Minimum sample length before computing the statistic (referee point
+    # 10): with overlapping h-step errors, short subsamples give unreliable
+    # HAC variances.  Require at least max(30, 10*h) observations.
+    n_min_dm <- max(30L, 10L * h)
+    dm_lvl <- if (sum(ok_lvl) >= n_min_dm)
+      dm_hln(e_m[ok_lvl], e_b[ok_lvl], h) else
+      list(stat = NA_real_, pvalue = NA_real_)
+    dm_as  <- if (any(ok_as) && sum(ok_as) >= n_min_dm)
+      dm_hln(ea_m[ok_as], ea_b[ok_as], h) else
+      list(stat = NA_real_, pvalue = NA_real_)
     rows[[pn]] <- data.frame(
       family = family, model = label, h = h, period = pn,
       n = sum(ok_lvl),
@@ -214,7 +222,10 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
       rmse_bench  = rmse_(e_b[ok_lvl]),
       rmse_ratio  = rmse_(e_m[ok_lvl]) / rmse_(e_b[ok_lvl]),
       mae_ratio   = mae_(e_m[ok_lvl])  / mae_(e_b[ok_lvl]),
-      rmse_ratio_asinh = rmse_(ea_m[ok_as]) / rmse_(ea_b[ok_as]),
+      # Explicit guard (referee point 7): undefined when no valid pair of
+      # transformed-scale observations remains in the subsample.
+      rmse_ratio_asinh = if (any(ok_as))
+        rmse_(ea_m[ok_as]) / rmse_(ea_b[ok_as]) else NA_real_,
       dm_stat = dm_lvl$stat, dm_pval = dm_lvl$pvalue,
       dm_stat_asinh = dm_as$stat, dm_pval_asinh = dm_as$pvalue,
       stringsAsFactors = FALSE

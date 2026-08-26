@@ -69,7 +69,10 @@ run_ar_country <- function(country) {
   base_cols <- c("intercept", cal_cols, ar_cols)
 
   origins <- make_origins(n, WINDOW_DAYS,
-                          pre_lag_max = max(c(AR_LAGS, Q_HF)),
+                          # Max lag actually used: AR lags {1,2,3,7} and the
+                          # fuel lag-1 columns, so 7 pre-sample days suffice
+                          # (referee point 11; was 14 via Q_HF).
+                          pre_lag_max = max(AR_LAGS),
                           h_max = H_MAX)
   n_orig <- length(origins)
   cat(sprintf("  rolling origins: %d (from %s to %s)\n",
@@ -83,7 +86,10 @@ run_ar_country <- function(country) {
   fit_one_spec <- function(spec_name) {
     cols <- c(base_cols, specs[[spec_name]]$extra_cols)  # columns of THIS spec
     yhat_mat <- matrix(NA_real_, n_orig, H_MAX)
-    sigma2_vec <- rep(NA_real_, n_orig)
+    # Horizon-specific forecast-error variances sigma2_h (one row per origin,
+    # one column per step 1..H_MAX): used by the inverse-asinh bias
+    # correction, which must grow with the horizon (referee point 3).
+    sigma2_mat <- matrix(NA_real_, n_orig, H_MAX)
     for (oi in seq_along(origins)) {
       t0     <- origins[oi]                 # forecast origin (window end)
       win_lo <- t0 - WINDOW_DAYS + 1L      # window start
@@ -95,10 +101,14 @@ run_ar_country <- function(country) {
       if (qrfit$rank < ncol(Xtr)) next     # collinear design: skip origin
       beta   <- qr.coef(qrfit, ytr[ok])    # OLS coefficient vector
       names(beta) <- cols
-      # In-window residual variance: feeds the feasible inverse-asinh bias
-      # correction sinh(mu)*exp(sigma^2/2) written to the __bc columns.
+      # In-window one-step residual variance, then propagated to horizon h
+      # through the fitted AR dynamics (MA psi-weights): the __bc correction
+      # at horizon h uses sigma2_h = sigma2 * sum_{s<h} psi_s^2, NOT the
+      # one-step variance at every horizon.
       res <- ytr[ok] - drop(Xtr[ok, , drop = FALSE] %*% beta)
-      sigma2_vec[oi] <- mean(res^2)
+      phi <- as.numeric(beta[ar_cols])       # AR coefficients at lags 1,2,3,7
+      sigma2_mat[oi, ] <- iterated_error_variance(AR_LAGS, phi,
+                                                  mean(res^2), H_MAX)
 
       # Iterated multi-step: roll the one-step OLS equation forward h steps,
       # replacing the AR lag cells with realised prices where observed and
@@ -119,7 +129,7 @@ run_ar_country <- function(country) {
         holiday_dates = hol_set
       )
     }
-    list(spec = spec_name, yhat_mat = yhat_mat, sigma2 = sigma2_vec)
+    list(spec = spec_name, yhat_mat = yhat_mat, sigma2 = sigma2_mat)
   }
 
   t_start <- Sys.time()
@@ -137,7 +147,8 @@ run_ar_country <- function(country) {
     for (r in spec_results) {
       mu_h <- r$yhat_mat[, h]
       out[[r$spec]] <- sinh(mu_h)
-      out[[paste0(r$spec, "__bc")]] <- sinh(mu_h) * exp(r$sigma2 / 2)
+      # Bias correction with the h-step error variance (column h).
+      out[[paste0(r$spec, "__bc")]] <- sinh(mu_h) * exp(r$sigma2[, h] / 2)
     }
     out <- out[!is.na(out$y_actual), , drop = FALSE]
     fp <- file.path(FORECAST_DIR, sprintf("ar_%s_h%02d.csv", cc, h))

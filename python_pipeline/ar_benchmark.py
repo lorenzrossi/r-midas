@@ -50,8 +50,10 @@ def run_ar_country(country):
         "ar_dum_gas_brent": gas_cols + brt_cols,
     }
 
+    # Max lag actually used: AR {1,2,3,7} + fuel lag 1 -> 7 pre-sample days
+    # suffice (referee point 11; was 14 via Q_HF).
     origins = cu.make_origins(n, cu.WINDOW_DAYS,
-                              pre_lag_max=max(cu.AR_LAGS + [cu.Q_HF]),
+                              pre_lag_max=max(cu.AR_LAGS),
                               h_max=cu.H_MAX)
     n_orig = len(origins)
     print(f"  rolling origins: {n_orig} "
@@ -66,7 +68,8 @@ def run_ar_country(country):
         Xs = X_full[:, sel]
         ar_lag_idx = [cols.index(c) for c in ar_cols]
         yhat_mat = np.full((n_orig, cu.H_MAX), np.nan)
-        sigma2_vec = np.full(n_orig, np.nan)
+        # Horizon-specific forecast-error variances (referee point 3).
+        sigma2_mat = np.full((n_orig, cu.H_MAX), np.nan)
         for oi, t0 in enumerate(origins):
             lo = t0 - cu.WINDOW_DAYS + 1
             Xtr = Xs[lo:t0 + 1]
@@ -77,14 +80,18 @@ def run_ar_country(country):
             beta, _, rank, _ = np.linalg.lstsq(Xtr[ok], ytr[ok], rcond=None)
             if rank < Xtr.shape[1]:
                 continue
+            # One-step residual variance propagated to each horizon via
+            # the fitted AR dynamics (MA psi-weights).
             res = ytr[ok] - Xtr[ok] @ beta
-            sigma2_vec[oi] = float(np.mean(res**2))
+            phi = [beta[cols.index(c)] for c in ar_cols]
+            sigma2_mat[oi] = cu.iterated_error_variance(
+                cu.AR_LAGS, phi, float(np.mean(res**2)), cu.H_MAX)
             target_dates = [dates.iloc[t0 + 1 + s] for s in range(cu.H_MAX)]
             frow = Xs[t0 + 1].copy()
             yhat_mat[oi] = cu.iterated_forecast_linear(
                 beta, cols, y[:t0 + 1], frow, ar_lag_idx, cu.AR_LAGS,
                 target_dates, cu.H_MAX, hol_set)
-        results[spec_name] = (yhat_mat, sigma2_vec)
+        results[spec_name] = (yhat_mat, sigma2_mat)
     print(f"  fitting done in {time.time() - t0c:.1f}s")
 
     y_lvl = daily["elec_price"].to_numpy(float)
@@ -93,7 +100,8 @@ def run_ar_country(country):
         for nm, (ymat, s2) in results.items():
             mu = ymat[:, h - 1]
             cols[nm] = np.sinh(mu)
-            cols[f"{nm}__bc"] = np.sinh(mu) * np.exp(s2 / 2)
+            # Bias correction with the h-step error variance (column h-1).
+            cols[f"{nm}__bc"] = np.sinh(mu) * np.exp(s2[:, h - 1] / 2)
         fp = os.path.join(cu.FORECAST_DIR, f"ar_{cc}_h{h:02d}.csv")
         nrows = cu.write_forecast_csv(fp, dates, origins, h, y_lvl, cols)
         print(f"  wrote {fp}  (rows = {nrows})")
