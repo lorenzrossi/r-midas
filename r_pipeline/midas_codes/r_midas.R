@@ -192,20 +192,31 @@ run_r_midas <- function(country) {
                          dimnames = list(NULL, coef_cols))
     sigma2_vec <- rep(NA_real_, n_orig)
 
+    # ==== MAIN ROLLING-ORIGIN LOOP =========================================
+    # One iteration = one forecast origin t0: estimate the model on the
+    # WINDOW_DAYS days ending at t0, then forecast t0+1 ... t0+H_MAX.
     for (oi in seq_along(origins)) {
-      t0 <- origins[oi]
-      win_lo <- t0 - WINDOW_DAYS + 1L
-      win_rows <- win_lo:t0
-      ywin <- y[win_rows]
+      t0 <- origins[oi]                     # row index of the forecast origin
+      win_lo <- t0 - WINDOW_DAYS + 1L      # first row of the rolling window
+      win_rows <- win_lo:t0                # estimation window (ends AT t0)
+      ywin <- y[win_rows]                  # response: asinh(price) in window
 
+      # Almon block: the window rows of the (n x 4) matrix whose columns are
+      # y_{t-1}, y_{t-2}, y_{t-3}, y_{t-7} (lag set J of model.tex).  The NLS
+      # will weight these 4 columns with the exp-Almon weights b(j; theta).
       Z_list <- list(y_lags = ar_mat[win_rows, , drop = FALSE])
 
+      # Linear part of the design, assembled column-block by column-block:
+      # intercept + 18 calendar dummies (always) ...
       lin_cols  <- list(X_base[win_rows, , drop = FALSE])
       lin_names <- base_cols
+      # ... + one publication-aware daily column per LF variable in this spec
       if (length(lf_used) > 0L) {
         lin_cols[[length(lin_cols) + 1L]] <- lf_mat[win_rows, lf_used, drop = FALSE]
         lin_names <- c(lin_names, lf_used)
       }
+      # ... + one-day lags of the fuel prices when the spec includes them
+      # (linear, per model.tex: nothing to compress in a single lag)
       if ("gas" %in% hf_used) {
         lin_cols[[length(lin_cols) + 1L]] <- matrix(gas_lag1[win_rows], ncol = 1,
                                                     dimnames = list(NULL, "gas_lag1"))
@@ -216,13 +227,15 @@ run_r_midas <- function(country) {
                                                     dimnames = list(NULL, "brent_lag1"))
         lin_names <- c(lin_names, "brent_lag1")
       }
-      X_lin <- do.call(cbind, lin_cols)
+      X_lin <- do.call(cbind, lin_cols)    # window x p linear design
       colnames(X_lin) <- lin_names
 
+      # Keep only rows where response, every linear column and every Almon
+      # lag are observed (drops e.g. days before the first LF release).
       keep_train <- stats::complete.cases(X_lin) &
                     rows_all_finite(Z_list$y_lags) &
                     is.finite(ywin)
-      if (sum(keep_train) < ncol(X_lin) + 3L) next
+      if (sum(keep_train) < ncol(X_lin) + 3L) next   # too few obs: skip origin
 
       Xlin_fit <- X_lin[keep_train, , drop = FALSE]
       yfit     <- ywin[keep_train]
@@ -237,15 +250,24 @@ run_r_midas <- function(country) {
         Z_fit    <- lapply(Z_fit, function(M) M * sw)
       }
 
+      # Warm start: theta from the PREVIOUS origin of this spec (windows
+      # overlap by all but one day, so the optimum moves slowly).  Guard
+      # against a stale cache of the wrong dimension.
       if (!is.null(theta_warm) && length(theta_warm) != 2L) theta_warm <- NULL
 
+      # THE ESTIMATION.  Concentrated NLS (fit_r_midas_fast.R): for each
+      # candidate theta the linear coefficients are profiled out by OLS and
+      # the concentrated SSE is minimised over theta = (theta1, theta2) only,
+      # by L-BFGS-B on the box [-8,8] x [-8,0] (theta2 <= 0 = non-explosive
+      # weights), from the warm start + canonical shape restarts.
+      # lag_sets tells the estimator the Almon exponent uses j in {1,2,3,7}.
       fit <- fit_r_midas(yfit, Z_fit, Xlin_fit,
                          theta_init  = theta_warm,
                          optim_maxit = 2000L,
                          optim_factr = 5e8,
                          n_starts    = N_STARTS_R_MIDAS,
                          lag_sets    = AR_LAG_SETS)
-      if (is.null(fit)) next
+      if (is.null(fit)) next               # rank-deficient / degenerate window
 
       # ---- optional one-step Huber reweighting (RMIDAS_HUBER=1) -----------
       # Stage 1 = the fit above.  Compute its in-window residuals, build the
@@ -271,9 +293,14 @@ run_r_midas <- function(country) {
           if (!is.null(fit2)) fit <- fit2
         }
       }
-      theta_warm <- as.numeric(t(fit$theta))
+      theta_warm <- as.numeric(t(fit$theta))   # cache theta for next origin
+      # In-window residual variance sigma^2_t: used later for the feasible
+      # inverse-asinh bias correction  sinh(mu)*exp(sigma^2/2)  (__bc cols).
       sigma2_vec[oi] <- fit$sigma2
 
+      # Record the rolling coefficients: delta = total AR loading (the Almon
+      # weights sum to 1, so delta is the sum of the four implied AR
+      # coefficients) and the free loading of each LF variable.
       coef_mat[oi, "delta_y"] <- fit$delta["y_lags"]
       if (length(lf_used) > 0L) {
         for (v in lf_used) {
@@ -282,14 +309,23 @@ run_r_midas <- function(country) {
         }
       }
 
+      # ---- FORECAST-ROW CONSTRUCTION (information set at origin t0) -------
+      # Build the single linear row used at every iteration step:
+      #   calendar part taken at t0+1 (it is refreshed to the true target
+      #   date inside the forecaster anyway);
       lin_row_parts <- list(X_base[t0 + 1L, , drop = TRUE])
       lin_row_names <- base_cols
       if (length(lf_used) > 0L) {
-        # Low-frequency information must be known at the forecast origin.
+        # LF block FROZEN at row t0: the latest monthly value whose release
+        # date is <= the origin (real-time information set; row t0+1 could
+        # embed a release that appears only on the target day).
         lf_forecast <- lf_mat[t0, lf_used, drop = FALSE]
         lin_row_parts[[length(lin_row_parts) + 1L]] <- drop(lf_forecast)
         lin_row_names <- c(lin_row_names, lf_used)
       }
+      # Fuel lag-1 columns at row t0+1 = the fuel price OBSERVED at t0
+      # (the lag-1 column at row t is the value of day t-1), then frozen
+      # across all iteration steps: future fuel prices are unknown at t0.
       if ("gas" %in% hf_used) {
         lin_row_parts[[length(lin_row_parts) + 1L]] <- gas_lag1[t0 + 1L]
         lin_row_names <- c(lin_row_names, "gas_lag1")
@@ -300,8 +336,13 @@ run_r_midas <- function(country) {
       }
       X_lin_row <- unlist(lin_row_parts)
       names(X_lin_row) <- lin_row_names
-      if (anyNA(X_lin_row)) next
+      if (anyNA(X_lin_row)) next           # regressor missing at the origin
 
+      # ---- ITERATED MULTI-STEP FORECAST (option c.1) ----------------------
+      # One-step model rolled forward h = 1..H_MAX: the AR-Almon block is
+      # rebuilt at each step from realised prices where available and from
+      # the model's own previous-step forecasts otherwise; calendar dummies
+      # are set to the true target dates; LF and fuel terms stay frozen.
       target_dates <- dates[(t0 + 1L):(t0 + H_MAX)]
       yhat_mat[oi, ] <- iterated_forecast_r_midas(
         fit_obj         = fit,

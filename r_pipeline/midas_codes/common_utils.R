@@ -661,29 +661,41 @@ iterated_forecast_r_midas <- function(fit_obj, Z_list_full, X_lin_row,
     frozen_z[nm] <- sum(W[[nm]] * Z_list_full[[nm]][origin_idx + 1L, ])
   }
 
+  # Iterate the one-step model forward: step s forecasts target t0+s.
+  # history_y_aug starts as the realised prices up to the origin and grows
+  # by one forecast per step, so later steps feed on earlier forecasts
+  # (the iterated multi-step scheme of Marcellino-Stock-Watson 2006).
   y_hat_h <- numeric(h_max)
   for (s in 1:h_max) {
+    # Calendar dummies are deterministic: overwrite the month/weekday/
+    # holiday cells of the frozen row with the TRUE target-date values.
     row_lin <- refresh_calendar_row(X_lin_row, X_lin_colnames,
                                     target_dates[s], holiday_dates)
-    lin_part <- sum(beta_lin * row_lin)
+    lin_part <- sum(beta_lin * row_lin)   # intercept + dummies + LF + fuel
 
+    # AR-Almon block: pick lags j in the lag set (1,2,3,7 days before the
+    # CURRENT target) out of the augmented history; realised values where
+    # available, previous-step forecasts otherwise.
     n_hist <- length(history_y_aug)
     ar_idx_in_hist <- n_hist - ar_lag_set + 1L
-    if (any(ar_idx_in_hist < 1L)) {
+    if (any(ar_idx_in_hist < 1L)) {       # not enough history: emit NA
       y_hat_h[s] <- NA_real_
       history_y_aug <- c(history_y_aug, NA_real_)
       next
     }
-    z_y <- sum(W[[ar_block_name]] * history_y_aug[ar_idx_in_hist])
+    z_y <- sum(W[[ar_block_name]] * history_y_aug[ar_idx_in_hist])  # b(j)'y_lags
 
+    # Extended model only: Almon-weighted fuel blocks, frozen at their
+    # origin value (future fuel paths unknown at the origin).
     hf_part <- 0
     for (nm in hf_block_names) {
       hf_part <- hf_part + delta_v[nm] * frozen_z[nm]
     }
 
+    # One-step equation:  y_hat = linear part + delta * z_ar (+ fuel blocks)
     yh <- lin_part + delta_v[ar_block_name] * z_y + hf_part
     y_hat_h[s] <- yh
-    history_y_aug <- c(history_y_aug, yh)
+    history_y_aug <- c(history_y_aug, yh)  # append: becomes a lag for s+1
   }
   y_hat_h
 }

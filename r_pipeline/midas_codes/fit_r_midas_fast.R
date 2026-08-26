@@ -69,28 +69,39 @@ fit_r_midas_fast <- function(y, Z_list, X_lin,
   Zk <- lapply(Z_list, function(M) M[keep, , drop = FALSE])
 
   # ---- one-off FWL pre-computation ------------------------------------------
-  qrX <- qr(Xk)
-  if (qrX$rank < ncol(Xk)) return(NULL)
-  Zt <- do.call(cbind, lapply(Zk, function(M) qr.resid(qrX, M)))  # n x KQ
-  yt <- qr.resid(qrX, yk)
-  G  <- crossprod(Zt)              # (sum Q_k) x (sum Q_k)   (theta-free)
-  cv <- drop(crossprod(Zt, yt))    # (sum Q_k)               (theta-free)
-  yy <- sum(yt^2)
+  # Frisch-Waugh-Lovell: the OLS fit of y on [X, z(theta)] has the SAME SSE
+  # as the fit of (y projected off X) on (z projected off X).  The
+  # projections do not depend on theta, so they are computed ONCE per window
+  # and every theta evaluation below becomes a tiny K-variable regression.
+  qrX <- qr(Xk)                              # QR factorisation of the linear block
+  if (qrX$rank < ncol(Xk)) return(NULL)      # collinear linear block: give up
+  Zt <- do.call(cbind, lapply(Zk, function(M) qr.resid(qrX, M)))  # M_X Z (n x sumQ)
+  yt <- qr.resid(qrX, yk)                    # M_X y  (residual of y on X)
+  G  <- crossprod(Zt)              # Zt'Zt, (sum Q_k) x (sum Q_k), theta-free
+  cv <- drop(crossprod(Zt, yt))    # Zt'yt, theta-free
+  yy <- sum(yt^2)                  # yt'yt: SSE of the model WITHOUT Almon blocks
   Qtot <- sum(Qs)
-  blk <- split(seq_len(Qtot), rep(seq_len(K), Qs))
+  blk <- split(seq_len(Qtot), rep(seq_len(K), Qs))  # column ranges per block
 
   # ---- concentrated SSE: O((sum Q_k)^2), independent of n -------------------
+  # The concentrated objective S(theta) handed to L-BFGS-B.  For a candidate
+  # theta it evaluates the SSE of the FULL model exactly, without touching
+  # the n x p design again:
+  #   S(theta) = yt'yt - b'A^{-1}b,  A_kl = w_k'(Zt_k'Zt_l)w_l,  b_k = w_k'Zt_k'yt
+  # (the closed form of profiling delta out by OLS given the weights).
   obj <- function(theta_v) {
+    # Stack the exp-Almon weight vector of each block into a block-diagonal
+    # (sumQ x K) matrix W; theta_v holds (theta1, theta2) per block.
     W <- matrix(0, Qtot, K)
     for (k in seq_len(K))
       W[blk[[k]], k] <- exp_almon_weights_j(lag_sets[[block_names[k]]],
                                             theta_v[(2L * k - 1L):(2L * k)])
-    A <- crossprod(W, G %*% W)     # K x K
-    b <- drop(crossprod(W, cv))    # K
-    d <- tryCatch(solve(A, b), error = function(e) NULL)
-    if (is.null(d) || !all(is.finite(d))) return(1e12)
-    sse <- yy - sum(b * d)
-    if (!is.finite(sse) || sse < -1e-6 * yy) return(1e12)
+    A <- crossprod(W, G %*% W)     # K x K  Gram matrix of the weighted blocks
+    b <- drop(crossprod(W, cv))    # K      covariances with the response
+    d <- tryCatch(solve(A, b), error = function(e) NULL)  # profiled delta
+    if (is.null(d) || !all(is.finite(d))) return(1e12)    # singular: reject
+    sse <- yy - sum(b * d)         # concentrated SSE at this theta
+    if (!is.finite(sse) || sse < -1e-6 * yy) return(1e12) # numerical guard
     max(sse, 0)
   }
 
@@ -141,20 +152,24 @@ fit_r_midas_fast <- function(y, Z_list, X_lin,
   theta_hat <- best$par
 
   # ---- final fit at theta_hat: SAME code path as the original ---------------
+  # With theta fixed at its optimum, run ONE ordinary OLS of y on
+  # [X, z_1(theta_hat), ..., z_K(theta_hat)] to recover every linear
+  # coefficient (intercept, calendar, LF, fuel lags, delta scales) and the
+  # residual variance on the original (unprojected) design.
   zmat <- matrix(NA_real_, length(yk), K)
-  for (k in seq_len(K))
+  for (k in seq_len(K))                      # z_k = Z_k %*% w(theta_hat_k)
     zmat[, k] <- as.numeric(Zk[[k]] %*%
                    exp_almon_weights_j(lag_sets[[block_names[k]]],
                                        theta_hat[(2L * k - 1L):(2L * k)]))
-  Xfull <- cbind(Xk, zmat)
+  Xfull <- cbind(Xk, zmat)                   # full design at theta_hat
   qrfit <- qr(Xfull)
-  if (qrfit$rank < ncol(Xfull)) return(NULL)
-  beta_full <- qr.coef(qrfit, yk)
-  res       <- yk - drop(Xfull %*% beta_full)
+  if (qrfit$rank < ncol(Xfull)) return(NULL) # z collinear with X: unidentified
+  beta_full <- qr.coef(qrfit, yk)            # OLS coefficients
+  res       <- yk - drop(Xfull %*% beta_full)# in-window residuals
   p_lin     <- ncol(Xk)
-  beta_lin  <- beta_full[1:p_lin]
+  beta_lin  <- beta_full[1:p_lin]            # linear part (X columns)
   names(beta_lin) <- colnames(Xk)
-  delta     <- beta_full[(p_lin + 1L):(p_lin + K)]
+  delta     <- beta_full[(p_lin + 1L):(p_lin + K)]  # Almon block scales
   names(delta) <- names(Z_list)
   theta_mat <- matrix(theta_hat, nrow = K, ncol = 2L, byrow = TRUE,
                       dimnames = list(names(Z_list), c("theta1", "theta2")))

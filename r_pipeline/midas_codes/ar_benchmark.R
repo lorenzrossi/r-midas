@@ -76,26 +76,36 @@ run_ar_country <- function(country) {
               n_orig, format(dates[origins[1]]),
               format(dates[origins[n_orig]])))
 
+  # One AR-family specification across all rolling origins.  The design is
+  # fully linear (no Almon block), so each window is a single OLS:
+  #   asinh(price)_t = intercept + calendar dummies + AR(1,2,3,7) lags
+  #                    [+ gas_lag1] [+ brent_lag1] + error
   fit_one_spec <- function(spec_name) {
-    cols <- c(base_cols, specs[[spec_name]]$extra_cols)
+    cols <- c(base_cols, specs[[spec_name]]$extra_cols)  # columns of THIS spec
     yhat_mat <- matrix(NA_real_, n_orig, H_MAX)
     sigma2_vec <- rep(NA_real_, n_orig)
     for (oi in seq_along(origins)) {
-      t0     <- origins[oi]
-      win_lo <- t0 - WINDOW_DAYS + 1L
-      Xtr    <- X_full[win_lo:t0, cols, drop = FALSE]
-      ytr    <- y[win_lo:t0]
-      ok     <- stats::complete.cases(Xtr) & is.finite(ytr)
-      if (sum(ok) < ncol(Xtr) + 5L) next
-      qrfit  <- qr(Xtr[ok, , drop = FALSE])
-      if (qrfit$rank < ncol(Xtr)) next
-      beta   <- qr.coef(qrfit, ytr[ok])
+      t0     <- origins[oi]                 # forecast origin (window end)
+      win_lo <- t0 - WINDOW_DAYS + 1L      # window start
+      Xtr    <- X_full[win_lo:t0, cols, drop = FALSE]  # window design
+      ytr    <- y[win_lo:t0]               # window response (asinh scale)
+      ok     <- stats::complete.cases(Xtr) & is.finite(ytr)  # drop NA rows
+      if (sum(ok) < ncol(Xtr) + 5L) next   # too few observations: skip
+      qrfit  <- qr(Xtr[ok, , drop = FALSE])# OLS via QR decomposition
+      if (qrfit$rank < ncol(Xtr)) next     # collinear design: skip origin
+      beta   <- qr.coef(qrfit, ytr[ok])    # OLS coefficient vector
       names(beta) <- cols
+      # In-window residual variance: feeds the feasible inverse-asinh bias
+      # correction sinh(mu)*exp(sigma^2/2) written to the __bc columns.
       res <- ytr[ok] - drop(Xtr[ok, , drop = FALSE] %*% beta)
       sigma2_vec[oi] <- mean(res^2)
 
+      # Iterated multi-step: roll the one-step OLS equation forward h steps,
+      # replacing the AR lag cells with realised prices where observed and
+      # with previous-step forecasts otherwise; calendar cells refreshed at
+      # each true target date; fuel lag-1 cells frozen at the origin value.
       target_dates <- dates[(t0 + 1L):(t0 + H_MAX)]
-      frow         <- X_full[t0 + 1L, cols, drop = TRUE]
+      frow         <- X_full[t0 + 1L, cols, drop = TRUE]  # frozen base row
       yhat_mat[oi, ] <- iterated_forecast(
         coef          = beta,
         colnames_     = cols,
