@@ -35,7 +35,7 @@ def _families():
 
 
 TRAIL_DAYS   = int(os.environ.get("TRAIL_DAYS", "90"))
-TOP_N_SPECS  = int(os.environ.get("TOP_N_SPECS", "10"))
+TOP_N_SPECS  = int(os.environ.get("TOP_N_SPECS", "0"))  # 0 = ALL specs
 MIN_RESOLVED = int(os.environ.get("MIN_RESOLVED", "30"))
 TRIM         = float(os.environ.get("TRIM", "0.2"))
 GR_MU        = float(os.environ.get("GR_MU", "0.3"))
@@ -89,8 +89,9 @@ def trim_mean_rows(F, trim=TRIM):
     return out
 
 
-def combine_invmse(F, y, odates, h, trail=TRAIL_DAYS, min_res=MIN_RESOLVED):
-    n, _ = F.shape
+def combine_invmse(F, y, odates, h, trail=TRAIL_DAYS, min_res=MIN_RESOLVED,
+                   return_weights=False):
+    n, S = F.shape
     E2 = (F - y[:, None])**2
     ok = np.isfinite(E2)
     E2z = np.where(ok, E2, 0.0)
@@ -99,22 +100,35 @@ def combine_invmse(F, y, odates, h, trail=TRAIL_DAYS, min_res=MIN_RESOLVED):
     od = odates.astype("datetime64[D]").astype(int)
     out = np.full(n, np.nan)
     eqm = np.nanmean(F, axis=1)
+    Wm = np.full((n, S), np.nan) if return_weights else None
     for i in range(n):
+        fi = F[i]
         b = np.searchsorted(od, od[i] - h, side="right") - 1
         a = np.searchsorted(od, od[i] - h - trail, side="right") - 1
         if b <= a or b < 0:
             out[i] = eqm[i]
+            if return_weights:
+                fin = np.isfinite(fi)
+                if fin.any():
+                    Wm[i, fin] = 1.0 / fin.sum()
             continue
         cnt = CN[b] - (CN[a] if a >= 0 else 0)
         sse = CS[b] - (CS[a] if a >= 0 else 0)
         with np.errstate(divide="ignore", invalid="ignore"):
             mse = np.where(cnt >= min_res, sse / np.maximum(cnt, 1), np.nan)
             w = 1.0 / mse
-        fi = F[i]
         use = np.isfinite(fi) & np.isfinite(w) & (w > 0)
-        out[i] = (np.sum(w[use] * fi[use]) / np.sum(w[use])
-                  if use.any() else eqm[i])
-    return out
+        if use.any():
+            out[i] = np.sum(w[use] * fi[use]) / np.sum(w[use])
+            if return_weights:
+                Wm[i, use] = w[use] / np.sum(w[use])
+        else:
+            out[i] = eqm[i]
+            if return_weights:
+                fin = np.isfinite(fi)
+                if fin.any():
+                    Wm[i, fin] = 1.0 / fin.sum()
+    return (out, Wm) if return_weights else out
 
 
 def gr_fluctuation(e_bench, e_model, tdates, h, mu=GR_MU):
@@ -157,12 +171,11 @@ def eval_model(label, family, h, yhat, y, ybench, tdates):
         ok_a = sel & np.isfinite(ea_m) & np.isfinite(ea_b)
         if not ok_l.any():
             continue
-        if pn == "full":
-            dm_lvl = cu.dm_hln(e_m[ok_l], e_b[ok_l], h)
-            dm_as = (cu.dm_hln(ea_m[ok_a], ea_b[ok_a], h)
-                     if ok_a.any() else {"stat": np.nan, "pvalue": np.nan})
-        else:
-            dm_lvl = dm_as = {"stat": np.nan, "pvalue": np.nan}
+        # DM-HLN computed within EVERY period (unconditional test on the
+        # subsample, same h-1 HAC truncation); GR covers time variation.
+        dm_lvl = cu.dm_hln(e_m[ok_l], e_b[ok_l], h)
+        dm_as = (cu.dm_hln(ea_m[ok_a], ea_b[ok_a], h)
+                 if ok_a.any() else {"stat": np.nan, "pvalue": np.nan})
         rows.append({
             "family": family, "model": label, "h": h, "period": pn,
             "n": int(np.sum(ok_l)),
@@ -180,6 +193,7 @@ def run_country(country):
     cc = "de" if country == "Germany" else "it"
     print(f"\n=== Combination + subperiod + GR fluctuation - {country} ===")
     sum_rows, gr_rows = [], []
+    w1_rows = []   # stage-1 average combination weights (diagnostics)
 
     for h in cu.HORIZONS:
         ar_fp = os.path.join(cu.FORECAST_DIR, f"ar_{cc}_h{h:02d}.csv")
@@ -235,13 +249,29 @@ def run_country(country):
             # diluted to ~2/258 and the fallback never bites).
             comb_eq = np.nanmean(F, axis=1)
             comb_trim = trim_mean_rows(F)
-            comb_invmse_fam = combine_invmse(F, y2,
-                                             mg["origin_date"].to_numpy(), h)
+            comb_invmse_fam, W1 = combine_invmse(
+                F, y2, mg["origin_date"].to_numpy(), h, return_weights=True)
+            # Diagnostics: average stage-1 weight per spec across origins —
+            # shows which specs de facto drive the family combination.
+            w1_rows += [{"family": fam, "h": h, "spec": sname,
+                         "avg_weight": aw}
+                        for sname, aw in zip(specs,
+                                             np.nanmean(W1, axis=0))]
             if ar_pool:
                 F_pool = np.column_stack(
                     [comb_invmse_fam, mg[ar_pool].to_numpy(float)])
-                comb_invmse = combine_invmse(F_pool, y2,
-                                             mg["origin_date"].to_numpy(), h)
+                comb_invmse, W2 = combine_invmse(
+                    F_pool, y2, mg["origin_date"].to_numpy(), h,
+                    return_weights=True)
+                # Diagnostics: full stage-2 weight path (3 candidates) —
+                # shows WHEN the combination migrates to the AR and back.
+                w2 = pd.DataFrame(
+                    W2, columns=["comb_fam"] + ar_pool)
+                w2.insert(0, "origin_date",
+                          mg["origin_date"].dt.strftime("%Y-%m-%d").to_numpy())
+                w2.to_csv(os.path.join(
+                    cu.FORECAST_DIR, f"comb_w2_{fam}_{cc}_h{h:02d}.csv"),
+                    index=False)
             else:
                 comb_invmse = comb_invmse_fam
 
@@ -256,12 +286,18 @@ def run_country(country):
                                f"comb_{fam}_{cc}_h{h:02d}.csv")
             combo.to_csv(cfp, index=False)
 
+            # TOP_N_SPECS <= 0 (default): evaluate ALL specs with plain
+            # labels (no selection, no "_expost" flag).  N > 0: only the N
+            # best full-sample specs, "_expost"-labelled because the ranking
+            # uses the whole evaluation sample (look-ahead; disclose).
             full_rmse = {s: rmse_(F[:, j] - y2)
                          for j, s in enumerate(specs)}
-            top_specs = sorted(full_rmse, key=full_rmse.get)[:TOP_N_SPECS]
-            best_spec = top_specs[0]
-            models = {f"{s}_expost": F[:, specs.index(s)]
-                      for s in top_specs}
+            ranked = sorted(full_rmse, key=full_rmse.get)
+            all_mode = TOP_N_SPECS <= 0 or TOP_N_SPECS >= len(specs)
+            sel_specs = specs if all_mode else ranked[:TOP_N_SPECS]
+            best_spec = ranked[0]
+            models = {(s if all_mode else f"{s}_expost"):
+                      F[:, specs.index(s)] for s in sel_specs}
             models.update({
                 "comb_eq": comb_eq, "comb_trim": comb_trim,
                 "comb_invmse_fam": comb_invmse_fam,
@@ -272,14 +308,20 @@ def run_country(country):
                 if gr:
                     gr_rows.append({"family": fam, "model": lbl,
                                     "h": h, **gr})
-            print(f"  {fam} h={h:02d}: best ex-post spec {best_spec}; "
-                  f"combos written to {os.path.basename(cfp)}")
+            print(f"  {fam} h={h:02d}: {len(sel_specs)} specs evaluated "
+                  f"(best full-sample: {best_spec}); combos written")
 
     sum_df = pd.DataFrame(sum_rows)
     sum_df["country"] = cc
     sp = os.path.join(cu.RESULT_DIR, f"summary_subperiod_{cc}.csv")
     sum_df.to_csv(sp, index=False)
     print(f"  wrote {sp}  (rows = {len(sum_df)})")
+
+    if w1_rows:
+        w1_df = pd.DataFrame(w1_rows)
+        w1_df["country"] = cc
+        w1_df.to_csv(os.path.join(
+            cu.RESULT_DIR, f"comb_weights_stage1_{cc}.csv"), index=False)
 
     if gr_rows:
         gr_df = pd.DataFrame(gr_rows)

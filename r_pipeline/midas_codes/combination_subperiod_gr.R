@@ -72,7 +72,7 @@ dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 FAMILIES     <- strsplit(Sys.getenv("FAMILIES", "r_midas,r_midas_extended"), ",")[[1]]
 TRAIL_DAYS   <- as.integer(Sys.getenv("TRAIL_DAYS",   "90"))
-TOP_N_SPECS  <- as.integer(Sys.getenv("TOP_N_SPECS",  "10"))
+TOP_N_SPECS  <- as.integer(Sys.getenv("TOP_N_SPECS",  "0"))  # 0 = ALL specs
 MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "30"))
 TRIM         <- as.numeric(Sys.getenv("TRIM",         "0.2"))
 GR_MU        <- as.numeric(Sys.getenv("GR_MU",        "0.3"))
@@ -110,7 +110,8 @@ mae_  <- function(e) { e <- e[is.finite(e)]; if (!length(e)) NA_real_ else mean(
 # target j + h, so at origin i only rows with odates[j] <= odates[i] - h are
 # usable; the MSE window is (odates[i] - h - trail, odates[i] - h].
 combine_invmse <- function(Fm, y, odates, h,
-                           trail = TRAIL_DAYS, min_res = MIN_RESOLVED) {
+                           trail = TRAIL_DAYS, min_res = MIN_RESOLVED,
+                           return_weights = FALSE) {
   n  <- nrow(Fm)
   E2 <- (Fm - y)^2
   ok <- is.finite(E2)
@@ -120,19 +121,37 @@ combine_invmse <- function(Fm, y, odates, h,
   od <- as.numeric(odates)
   out <- rep(NA_real_, n)
   eqm <- rowMeans(Fm, na.rm = TRUE)        # fallback
+  W <- if (return_weights) matrix(NA_real_, n, ncol(Fm),
+                                  dimnames = list(NULL, colnames(Fm))) else NULL
   for (i in seq_len(n)) {
+    fi <- Fm[i, ]
     b <- findInterval(od[i] - h, od)
     a <- findInterval(od[i] - h - trail, od)
-    if (b <= a || b < 1L) { out[i] <- eqm[i]; next }
+    if (b <= a || b < 1L) {                 # no resolved errors yet:
+      out[i] <- eqm[i]                      # equal-weight fallback
+      if (return_weights) {
+        fin <- is.finite(fi)
+        if (any(fin)) W[i, fin] <- 1 / sum(fin)
+      }
+      next
+    }
     cnt <- CN[b, ] - if (a >= 1L) CN[a, ] else 0
     sse <- CS[b, ] - if (a >= 1L) CS[a, ] else 0
     mse <- ifelse(cnt >= min_res, sse / pmax(cnt, 1L), NA_real_)
     w   <- 1 / mse
-    fi  <- Fm[i, ]
     use <- is.finite(fi) & is.finite(w) & w > 0
-    out[i] <- if (any(use)) sum(w[use] * fi[use]) / sum(w[use]) else eqm[i]
+    if (any(use)) {
+      out[i] <- sum(w[use] * fi[use]) / sum(w[use])
+      if (return_weights) W[i, use] <- w[use] / sum(w[use])
+    } else {
+      out[i] <- eqm[i]
+      if (return_weights) {
+        fin <- is.finite(fi)
+        if (any(fin)) W[i, fin] <- 1 / sum(fin)
+      }
+    }
   }
-  out
+  if (return_weights) list(out = out, W = W) else out
 }
 
 # Giacomini-Rossi (2010) two-sided fluctuation test, squared-error loss.
@@ -181,9 +200,12 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
     ok_lvl <- sel & is.finite(e_m) & is.finite(e_b)
     ok_as  <- sel & is.finite(ea_m) & is.finite(ea_b)
     if (!any(ok_lvl)) next
-    dm_lvl <- if (pn == "full") dm_hln(e_m[ok_lvl], e_b[ok_lvl], h) else
-                list(stat = NA_real_, pvalue = NA_real_)
-    dm_as  <- if (pn == "full") dm_hln(ea_m[ok_as], ea_b[ok_as], h) else
+    # DM-HLN computed within EVERY period (not only the full sample): on a
+    # subsample it is the unconditional equal-accuracy test restricted to
+    # those target dates, with the same h-1 HAC truncation.  The GR test
+    # remains the instrument for the full time-varying picture.
+    dm_lvl <- dm_hln(e_m[ok_lvl], e_b[ok_lvl], h)
+    dm_as  <- if (any(ok_as)) dm_hln(ea_m[ok_as], ea_b[ok_as], h) else
                 list(stat = NA_real_, pvalue = NA_real_)
     rows[[pn]] <- data.frame(
       family = family, model = label, h = h, period = pn,
@@ -210,6 +232,7 @@ run_country <- function(country) {
 
   sum_rows <- list()
   gr_rows  <- list()
+  w1_rows  <- list()   # stage-1 average combination weights (diagnostics)
 
   for (h in HORIZONS) {
     ar_fp <- file.path(FORECAST_DIR, sprintf("ar_%s_h%02d.csv", cc, h))
@@ -266,12 +289,29 @@ run_country <- function(country) {
       # pool dilutes its weight to ~2/258 and has no effect.
       comb_eq     <- rowMeans(Fm, na.rm = TRUE)
       comb_trim   <- apply(Fm, 1, mean, trim = TRIM, na.rm = TRUE)
-      comb_invmse_fam <- combine_invmse(Fm, y, mg$origin_date, h)
-      comb_invmse <- if (length(ar_pool) > 0L) {
+      cf1 <- combine_invmse(Fm, y, mg$origin_date, h, return_weights = TRUE)
+      comb_invmse_fam <- cf1$out
+      # Diagnostics: average stage-1 weight per spec across origins — shows
+      # which specs de facto drive the family combination.
+      w1_rows[[length(w1_rows) + 1L]] <- data.frame(
+        family = fam, h = h, spec = colnames(Fm),
+        avg_weight = colMeans(cf1$W, na.rm = TRUE),
+        stringsAsFactors = FALSE)
+      if (length(ar_pool) > 0L) {
         F_pool <- cbind(comb_fam = comb_invmse_fam,
                         as.matrix(mg[, ar_pool, drop = FALSE]))
-        combine_invmse(F_pool, y, mg$origin_date, h)
-      } else comb_invmse_fam
+        cf2 <- combine_invmse(F_pool, y, mg$origin_date, h,
+                              return_weights = TRUE)
+        comb_invmse <- cf2$out
+        # Diagnostics: full stage-2 weight path (small: 3 candidates) — shows
+        # WHEN the combination migrates to the AR and back.
+        w2 <- data.frame(origin_date = format(mg$origin_date, "%Y-%m-%d"),
+                         cf2$W, check.names = FALSE,
+                         stringsAsFactors = FALSE)
+        w2p <- file.path(FORECAST_DIR,
+                         sprintf("comb_w2_%s_%s_h%02d.csv", fam, cc, h))
+        write.csv(w2, w2p, row.names = FALSE)
+      } else comb_invmse <- comb_invmse_fam
 
       combo <- data.frame(origin_date = mg$origin_date,
                           target_date = td, y_actual = y,
@@ -282,14 +322,23 @@ run_country <- function(country) {
       cfp <- file.path(FORECAST_DIR, sprintf("comb_%s_%s_h%02d.csv", fam, cc, h))
       write.csv(combo, cfp, row.names = FALSE)
 
-      # ---- top-N full-sample individual specs (ex post; look-ahead flag) --
+      # ---- individual specs to evaluate --------------------------------
+      # TOP_N_SPECS <= 0 (default): evaluate ALL specs, plain labels (no
+      # selection, hence no "_expost" flag).  TOP_N_SPECS = N > 0: only the
+      # N best full-sample specs, labelled "_expost" because the ranking
+      # uses the whole evaluation sample (look-ahead, disclose in the text).
       full_rmse <- apply(Fm, 2, function(f) rmse_(f - y))
       ord <- order(full_rmse)
-      top_specs <- specs[ord[seq_len(min(TOP_N_SPECS, length(specs)))]]
-      best_spec <- top_specs[1L]
+      all_mode <- TOP_N_SPECS <= 0L || TOP_N_SPECS >= length(specs)
+      sel_specs <- if (all_mode) specs else
+        specs[ord[seq_len(TOP_N_SPECS)]]
+      best_spec <- specs[ord[1L]]
 
       models <- list()
-      for (s in top_specs) models[[paste0(s, "_expost")]] <- Fm[, s]
+      for (s in sel_specs) {
+        lbl <- if (all_mode) s else paste0(s, "_expost")
+        models[[lbl]] <- Fm[, s]
+      }
       models[["comb_eq"]]          <- comb_eq
       models[["comb_trim"]]        <- comb_trim
       models[["comb_invmse_fam"]]  <- comb_invmse_fam
@@ -322,6 +371,14 @@ run_country <- function(country) {
     gp <- file.path(RESULT_DIR, sprintf("gr_fluctuation_%s.csv", cc))
     write.csv(gr_df, gp, row.names = FALSE)
     cat(sprintf("  wrote %s  (rows = %d)\n", gp, nrow(gr_df)))
+  }
+
+  if (length(w1_rows) > 0L) {
+    w1_df <- do.call(rbind, w1_rows)
+    w1_df$country <- cc
+    wp <- file.path(RESULT_DIR, sprintf("comb_weights_stage1_%s.csv", cc))
+    write.csv(w1_df, wp, row.names = FALSE)
+    cat(sprintf("  wrote %s  (rows = %d)\n", wp, nrow(w1_df)))
   }
 }
 
