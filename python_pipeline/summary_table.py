@@ -183,6 +183,37 @@ def main():
             summary.loc[sel, "lf_vars"] = \
                 summary.loc[sel, "model"].map(d["lf_vars"]).to_numpy()
 
+    # Unified `variables` description column (specs: dictionary subset;
+    # AR / COMB models: explicit content descriptions); empty HF/LF -> none.
+    AR_DESC_S = {
+        "ar_dum":           "AR(1,2,3,7) + calendar dummies [BENCHMARK]",
+        "ar_dum_gas":       "AR(1,2,3,7) + calendar + gas lag1",
+        "ar_dum_brent":     "AR(1,2,3,7) + calendar + brent lag1",
+        "ar_dum_gas_brent": "AR(1,2,3,7) + calendar + gas lag1 + brent lag1",
+    }
+    COMB_DESC_S = {
+        "comb_eq":         "equal-weight comb. of all R-MIDAS specs",
+        "comb_trim":       "20%-trimmed-mean comb. of all R-MIDAS specs",
+        "comb_invmse_fam": "inverse-MSE comb. of all R-MIDAS specs (90d trail)",
+        "comb_invmse":     "two-stage inverse-MSE comb.: "
+                           "{family comb., ar_dum, ar_dum_gas}",
+    }
+    spec_fam = summary["family"].isin(
+        ["R_MIDAS", "RU_MIDAS", "R_MIDAS_extended", "R_MIDAS_surveys"])
+    summary.loc[spec_fam, "hf_vars"] = \
+        summary.loc[spec_fam, "hf_vars"].fillna("none").replace("", "none")
+    summary.loc[spec_fam, "lf_vars"] = \
+        summary.loc[spec_fam, "lf_vars"].fillna("none").replace("", "none")
+    summary["variables"] = np.where(
+        spec_fam,
+        "HF: " + summary["hf_vars"].astype(str)
+        + " + LF: " + summary["lf_vars"].astype(str), "")
+    summary.loc[summary["model"].isin(AR_DESC_S), "variables"] = \
+        summary.loc[summary["model"].isin(AR_DESC_S), "model"].map(AR_DESC_S)
+    summary.loc[summary["model"].isin(COMB_DESC_S), "variables"] = \
+        summary.loc[summary["model"].isin(COMB_DESC_S),
+                    "model"].map(COMB_DESC_S)
+
     summary = summary.sort_values(
         ["country", "h", "family", "rmse_ratio"], na_position="last")
     out = os.path.join(cu.RESULT_DIR, "summary_table.csv")

@@ -190,16 +190,33 @@ gr_fluctuation <- function(e_bench, e_model, tdates, h, mu = GR_MU) {
 }
 
 # Subperiod + full-sample evaluation of one forecast vector vs the benchmark.
-eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
+# Per-model evaluation over the full sample and the three subperiods.
+#   yhat_bc / ybench_bc : bias-corrected forecasts (optional; NA metrics if
+#                         absent), so the bc block is CONSISTENT with
+#                         summary_table across every table.
+#   variables           : human-readable model composition, written into
+#                         every output row (specs: their variable subset;
+#                         AR models: their content; combinations: an
+#                         explicit description of the weighting scheme).
+eval_model <- function(label, family, h, yhat, y, ybench, tdates,
+                       yhat_bc = NULL, ybench_bc = NULL,
+                       variables = "") {
   e_m <- yhat - y
   e_b <- ybench - y
   ea_m <- asinh(yhat) - asinh(y)
   ea_b <- asinh(ybench) - asinh(y)
+  has_bc <- !is.null(yhat_bc) && !is.null(ybench_bc)
+  if (has_bc) {
+    eb_m <- yhat_bc - y
+    eb_b <- ybench_bc - y
+  }
   rows <- list()
   for (pn in names(PERIODS)) {
     sel <- tdates >= PERIODS[[pn]][1] & tdates <= PERIODS[[pn]][2]
     ok_lvl <- sel & is.finite(e_m) & is.finite(e_b)
     ok_as  <- sel & is.finite(ea_m) & is.finite(ea_b)
+    ok_bc  <- if (has_bc) sel & is.finite(eb_m) & is.finite(eb_b) else
+                rep(FALSE, length(sel))
     if (!any(ok_lvl)) next
     # DM-HLN computed within EVERY period (not only the full sample): on a
     # subsample it is the unconditional equal-accuracy test restricted to
@@ -215,8 +232,12 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
     dm_as  <- if (any(ok_as) && sum(ok_as) >= n_min_dm)
       dm_hln(ea_m[ok_as], ea_b[ok_as], h) else
       list(stat = NA_real_, pvalue = NA_real_)
+    dm_bc  <- if (any(ok_bc) && sum(ok_bc) >= n_min_dm)
+      dm_hln(eb_m[ok_bc], eb_b[ok_bc], h) else
+      list(stat = NA_real_, pvalue = NA_real_)
     rows[[pn]] <- data.frame(
-      family = family, model = label, h = h, period = pn,
+      family = family, model = label, variables = variables,
+      h = h, period = pn,
       n = sum(ok_lvl),
       rmse        = rmse_(e_m[ok_lvl]),
       rmse_bench  = rmse_(e_b[ok_lvl]),
@@ -226,12 +247,30 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates) {
       # transformed-scale observations remains in the subsample.
       rmse_ratio_asinh = if (any(ok_as))
         rmse_(ea_m[ok_as]) / rmse_(ea_b[ok_as]) else NA_real_,
+      mae_ratio_asinh = if (any(ok_as))
+        mae_(ea_m[ok_as]) / mae_(ea_b[ok_as]) else NA_real_,
+      rmse_bc_ratio = if (any(ok_bc))
+        rmse_(eb_m[ok_bc]) / rmse_(eb_b[ok_bc]) else NA_real_,
       dm_stat = dm_lvl$stat, dm_pval = dm_lvl$pvalue,
       dm_stat_asinh = dm_as$stat, dm_pval_asinh = dm_as$pvalue,
+      dm_bc_stat = dm_bc$stat, dm_bc_pval = dm_bc$pvalue,
       stringsAsFactors = FALSE
     )
   }
   do.call(rbind, rows)
+}
+
+# Weighted combination of the MEMBERS' bias-corrected forecasts, using the
+# weight matrix estimated from the ORDINARY forecast errors (renormalised
+# over members whose bc forecast is available at each origin).  This defines
+# the bias-corrected combination consistently: same weights, corrected
+# members.  Returns NA rows where no bc member is available.
+apply_weights_bc <- function(W, Fbc) {
+  num <- rowSums(ifelse(is.finite(Fbc), W * Fbc, NA), na.rm = TRUE)
+  den <- rowSums(ifelse(is.finite(Fbc), W, NA), na.rm = TRUE)
+  out <- num / den
+  out[!is.finite(out)] <- NA_real_
+  out
 }
 
 # -----------------------------------------------------------------------------
@@ -245,6 +284,23 @@ run_country <- function(country) {
   gr_rows  <- list()
   w1_rows  <- list()   # stage-1 average combination weights (diagnostics)
 
+  # Human-readable model descriptions written into the `variables` column
+  # of the subperiod and GR tables.
+  AR_DESC <- c(
+    ar_dum           = "AR(1,2,3,7) + calendar dummies [BENCHMARK]",
+    ar_dum_gas       = "AR(1,2,3,7) + calendar + gas lag1",
+    ar_dum_brent     = "AR(1,2,3,7) + calendar + brent lag1",
+    ar_dum_gas_brent = "AR(1,2,3,7) + calendar + gas lag1 + brent lag1"
+  )
+  COMB_DESC <- c(
+    comb_eq         = "equal-weight comb. of all R-MIDAS specs",
+    comb_trim       = "20%-trimmed-mean comb. of all R-MIDAS specs",
+    comb_invmse_fam = "inverse-MSE comb. of all R-MIDAS specs (90d trail)",
+    comb_invmse     = "two-stage inverse-MSE comb.: {family comb., ar_dum, ar_dum_gas}"
+  )
+  # Spec composition lookup from the spec dictionary (per family, loaded in
+  # the family loop below): spec_id -> "hf_vars + lf_vars".
+
   for (h in HORIZONS) {
     ar_fp <- file.path(FORECAST_DIR, sprintf("ar_%s_h%02d.csv", cc, h))
     if (!file.exists(ar_fp)) { cat("  missing", ar_fp, "— skipped\n"); next }
@@ -253,18 +309,25 @@ run_country <- function(country) {
     ar$target_date <- as.Date(ar$target_date)
     if (!BENCH_COL %in% names(ar)) stop("Benchmark column not found: ", BENCH_COL)
 
-    # AR variants vs ar_dum
+    # AR variants vs ar_dum (bc columns passed when present in the CSV)
+    bench_bc <- if ("ar_dum__bc" %in% names(ar)) ar[["ar_dum__bc"]] else NULL
     for (mcol in setdiff(names(ar), c("origin_date", "target_date",
                                       "y_actual", BENCH_COL,
                                       grep("__bc$", names(ar), value = TRUE)))) {
+      mdesc <- if (mcol %in% names(AR_DESC)) AR_DESC[[mcol]] else mcol
+      mbc   <- if (paste0(mcol, "__bc") %in% names(ar))
+        ar[[paste0(mcol, "__bc")]] else NULL
       sum_rows[[length(sum_rows) + 1L]] <-
         eval_model(mcol, "AR", h, ar[[mcol]], ar$y_actual,
-                   ar[[BENCH_COL]], ar$target_date)
+                   ar[[BENCH_COL]], ar$target_date,
+                   yhat_bc = mbc, ybench_bc = bench_bc,
+                   variables = mdesc)
       gr <- gr_fluctuation(ar[[BENCH_COL]] - ar$y_actual,
                            ar[[mcol]] - ar$y_actual, ar$target_date, h)
       if (!is.null(gr))
         gr_rows[[length(gr_rows) + 1L]] <-
-          data.frame(family = "AR", model = mcol, h = h, as.data.frame(gr),
+          data.frame(family = "AR", model = mcol, variables = mdesc,
+                     h = h, as.data.frame(gr),
                      stringsAsFactors = FALSE)
     }
 
@@ -277,8 +340,12 @@ run_country <- function(country) {
 
       ar_pool <- intersect(COMB_INCLUDE_AR, names(ar))
       ar_pool <- ar_pool[!grepl("__bc$", ar_pool)]
+      # Also carry the bias-corrected twins of the benchmark and of the AR
+      # pool candidates into the merge (needed for the bc combinations and
+      # the bc metric block).
+      ar_bc_cols <- intersect(paste0(c(BENCH_COL, ar_pool), "__bc"), names(ar))
       mg <- merge(ar[, unique(c("origin_date", "target_date", "y_actual",
-                                BENCH_COL, ar_pool))],
+                                BENCH_COL, ar_pool, ar_bc_cols))],
                   fc[, setdiff(names(fc), "y_actual")],
                   by = c("origin_date", "target_date"))
       mg <- mg[order(mg$origin_date), , drop = FALSE]
@@ -308,12 +375,36 @@ run_country <- function(country) {
         family = fam, h = h, spec = colnames(Fm),
         avg_weight = colMeans(cf1$W, na.rm = TRUE),
         stringsAsFactors = FALSE)
+      # ---- bias-corrected combinations ---------------------------------
+      # Same weights (estimated on ORDINARY resolved errors), applied to the
+      # members' bias-corrected forecasts (renormalised over available bc
+      # members).  Defines comb_*__bc consistently: corrected members,
+      # identical weighting scheme, no look-ahead.
+      spec_bc_cols <- paste0(specs, "__bc")
+      have_spec_bc <- all(spec_bc_cols %in% names(mg))
+      Fbc <- if (have_spec_bc) as.matrix(mg[, spec_bc_cols]) else NULL
+      comb_eq_bc   <- if (have_spec_bc) rowMeans(Fbc, na.rm = TRUE) else
+                        rep(NA_real_, length(y))
+      comb_trim_bc <- if (have_spec_bc)
+        apply(Fbc, 1, mean, trim = TRIM, na.rm = TRUE) else
+        rep(NA_real_, length(y))
+      comb_fam_bc  <- if (have_spec_bc) apply_weights_bc(cf1$W, Fbc) else
+                        rep(NA_real_, length(y))
+
       if (length(ar_pool) > 0L) {
         F_pool <- cbind(comb_fam = comb_invmse_fam,
                         as.matrix(mg[, ar_pool, drop = FALSE]))
         cf2 <- combine_invmse(F_pool, y, mg$origin_date, h,
                               return_weights = TRUE)
         comb_invmse <- cf2$out
+        # Stage-2 bc: same stage-2 weights on the bc members {family bc
+        # combo, ar bc candidates} where available.
+        pool_bc <- intersect(paste0(ar_pool, "__bc"), names(mg))
+        comb_invmse_bc <- if (have_spec_bc && length(pool_bc) == length(ar_pool)) {
+          F_pool_bc <- cbind(comb_fam_bc,
+                             as.matrix(mg[, pool_bc, drop = FALSE]))
+          apply_weights_bc(cf2$W, F_pool_bc)
+        } else rep(NA_real_, length(y))
         # Diagnostics: full stage-2 weight path (small: 3 candidates) — shows
         # WHEN the combination migrates to the AR and back.
         w2 <- data.frame(origin_date = format(mg$origin_date, "%Y-%m-%d"),
@@ -322,13 +413,21 @@ run_country <- function(country) {
         w2p <- file.path(FORECAST_DIR,
                          sprintf("comb_w2_%s_%s_h%02d.csv", fam, cc, h))
         write.csv(w2, w2p, row.names = FALSE)
-      } else comb_invmse <- comb_invmse_fam
+      } else {
+        comb_invmse    <- comb_invmse_fam
+        comb_invmse_bc <- comb_fam_bc
+      }
 
       combo <- data.frame(origin_date = mg$origin_date,
                           target_date = td, y_actual = y,
                           comb_eq = comb_eq, comb_trim = comb_trim,
                           comb_invmse_fam = comb_invmse_fam,
                           comb_invmse = comb_invmse,
+                          comb_eq__bc = comb_eq_bc,
+                          comb_trim__bc = comb_trim_bc,
+                          comb_invmse_fam__bc = comb_fam_bc,
+                          comb_invmse__bc = comb_invmse_bc,
+                          check.names = FALSE,
                           stringsAsFactors = FALSE)
       cfp <- file.path(FORECAST_DIR, sprintf("comb_%s_%s_h%02d.csv", fam, cc, h))
       write.csv(combo, cfp, row.names = FALSE)
@@ -345,23 +444,51 @@ run_country <- function(country) {
         specs[ord[seq_len(TOP_N_SPECS)]]
       best_spec <- specs[ord[1L]]
 
-      models <- list()
+      # Spec composition lookup ("gas|brent + pmi_serv|Energy" style) from
+      # the spec dictionary, so the `variables` column of every table says
+      # WHAT each model contains rather than only its id.
+      dict_fp <- file.path(FORECAST_DIR,
+                           sprintf("%s_spec_dictionary_%s.csv", fam, cc))
+      spec_desc <- setNames(rep("", length(specs)), specs)
+      if (file.exists(dict_fp)) {
+        dd <- read.csv(dict_fp, stringsAsFactors = FALSE)
+        dd$hf_vars[!nzchar(dd$hf_vars) | is.na(dd$hf_vars)] <- "none"
+        dd$lf_vars[!nzchar(dd$lf_vars) | is.na(dd$lf_vars)] <- "none"
+        spec_desc[dd$spec_id] <- paste0("HF: ", dd$hf_vars,
+                                        " + LF: ", dd$lf_vars)
+      }
+
+      models    <- list()
+      models_bc <- list()   # bias-corrected twin of each model (or NULL)
+      desc      <- list()   # `variables` text of each model
       for (s in sel_specs) {
         lbl <- if (all_mode) s else paste0(s, "_expost")
         models[[lbl]] <- Fm[, s]
+        bc_col <- paste0(s, "__bc")
+        models_bc[[lbl]] <- if (bc_col %in% names(mg)) mg[[bc_col]] else NULL
+        desc[[lbl]] <- spec_desc[[s]]
       }
       models[["comb_eq"]]          <- comb_eq
       models[["comb_trim"]]        <- comb_trim
       models[["comb_invmse_fam"]]  <- comb_invmse_fam
       models[["comb_invmse"]]      <- comb_invmse
+      models_bc[["comb_eq"]]         <- comb_eq_bc
+      models_bc[["comb_trim"]]       <- comb_trim_bc
+      models_bc[["comb_invmse_fam"]] <- comb_fam_bc
+      models_bc[["comb_invmse"]]     <- comb_invmse_bc
+      for (nm in names(COMB_DESC)) desc[[nm]] <- COMB_DESC[[nm]]
 
+      bench_bc2 <- if ("ar_dum__bc" %in% names(mg)) mg[["ar_dum__bc"]] else NULL
       for (lbl in names(models)) {
         sum_rows[[length(sum_rows) + 1L]] <-
-          eval_model(lbl, fam, h, models[[lbl]], y, yb, td)
+          eval_model(lbl, fam, h, models[[lbl]], y, yb, td,
+                     yhat_bc = models_bc[[lbl]], ybench_bc = bench_bc2,
+                     variables = desc[[lbl]])
         gr <- gr_fluctuation(yb - y, models[[lbl]] - y, td, h)
         if (!is.null(gr))
           gr_rows[[length(gr_rows) + 1L]] <-
-            data.frame(family = fam, model = lbl, h = h, as.data.frame(gr),
+            data.frame(family = fam, model = lbl,
+                       variables = desc[[lbl]], h = h, as.data.frame(gr),
                        stringsAsFactors = FALSE)
       }
       cat(sprintf("  %s h=%02d: best ex-post spec %s; combos written to %s\n",

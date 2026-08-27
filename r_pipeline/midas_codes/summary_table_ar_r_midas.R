@@ -244,6 +244,39 @@ for (cc in c("de", "it")) {
   }
 }
 
+
+# ---- unified `variables` description column --------------------------------
+# Specs: their variable subset from the dictionary; AR models and
+# combinations: explicit content descriptions.  Empty HF/LF sets shown as
+# "none" so no cell is blank.
+summary_df$hf_vars[is.na(summary_df$hf_vars) | !nzchar(summary_df$hf_vars)] <-
+  ifelse(summary_df$family[is.na(summary_df$hf_vars) |
+                           !nzchar(summary_df$hf_vars)] %in%
+           c("R_MIDAS", "RU_MIDAS", "R_MIDAS_extended", "R_MIDAS_surveys"),
+         "none", NA_character_)
+summary_df$lf_vars[!is.na(summary_df$hf_vars) & summary_df$hf_vars == "none" &
+                   (is.na(summary_df$lf_vars) | !nzchar(summary_df$lf_vars))] <- "none"
+AR_DESC_S <- c(
+  ar_dum           = "AR(1,2,3,7) + calendar dummies [BENCHMARK]",
+  ar_dum_gas       = "AR(1,2,3,7) + calendar + gas lag1",
+  ar_dum_brent     = "AR(1,2,3,7) + calendar + brent lag1",
+  ar_dum_gas_brent = "AR(1,2,3,7) + calendar + gas lag1 + brent lag1"
+)
+COMB_DESC_S <- c(
+  comb_eq         = "equal-weight comb. of all R-MIDAS specs",
+  comb_trim       = "20%-trimmed-mean comb. of all R-MIDAS specs",
+  comb_invmse_fam = "inverse-MSE comb. of all R-MIDAS specs (90d trail)",
+  comb_invmse     = "two-stage inverse-MSE comb.: {family comb., ar_dum, ar_dum_gas}"
+)
+summary_df$variables <- NA_character_
+has_dict <- !is.na(summary_df$hf_vars) & !is.na(summary_df$lf_vars)
+summary_df$variables[has_dict] <- paste0("HF: ", summary_df$hf_vars[has_dict],
+                                         " + LF: ", summary_df$lf_vars[has_dict])
+is_ar <- summary_df$model %in% names(AR_DESC_S)
+summary_df$variables[is_ar] <- AR_DESC_S[summary_df$model[is_ar]]
+is_cb <- summary_df$model %in% names(COMB_DESC_S)
+summary_df$variables[is_cb] <- COMB_DESC_S[summary_df$model[is_cb]]
+
 summary_df <- summary_df[order(summary_df$country, summary_df$h,
                                summary_df$family, summary_df$rmse_ratio,
                                na.last = TRUE), ]

@@ -134,6 +134,34 @@ def combine_invmse(F, y, odates, h, trail=TRAIL_DAYS, min_res=MIN_RESOLVED,
     return (out, Wm) if return_weights else out
 
 
+AR_DESC = {
+    "ar_dum":           "AR(1,2,3,7) + calendar dummies [BENCHMARK]",
+    "ar_dum_gas":       "AR(1,2,3,7) + calendar + gas lag1",
+    "ar_dum_brent":     "AR(1,2,3,7) + calendar + brent lag1",
+    "ar_dum_gas_brent": "AR(1,2,3,7) + calendar + gas lag1 + brent lag1",
+}
+COMB_DESC = {
+    "comb_eq":         "equal-weight comb. of all R-MIDAS specs",
+    "comb_trim":       "20%-trimmed-mean comb. of all R-MIDAS specs",
+    "comb_invmse_fam": "inverse-MSE comb. of all R-MIDAS specs (90d trail)",
+    "comb_invmse":     "two-stage inverse-MSE comb.: "
+                       "{family comb., ar_dum, ar_dum_gas}",
+}
+
+
+def apply_weights_bc(W, Fbc):
+    """Weighted combination of the members' bias-corrected forecasts using
+    the weights estimated from ORDINARY errors (renormalised over members
+    with an available bc forecast).  Same weights, corrected members."""
+    ok = np.isfinite(Fbc)
+    num = np.nansum(np.where(ok, W * Fbc, np.nan), axis=1)
+    den = np.nansum(np.where(ok, W, np.nan), axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = num / den
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
 def gr_fluctuation(e_bench, e_model, tdates, h, mu=GR_MU):
     ok = np.isfinite(e_bench) & np.isfinite(e_model)
     d = e_bench[ok]**2 - e_model[ok]**2        # > 0  ->  model better
@@ -160,11 +188,16 @@ def gr_fluctuation(e_bench, e_model, tdates, h, mu=GR_MU):
             "mu": mu_eff, "m": m, "n": n, "cv05": cv05, "cv10": cv10}
 
 
-def eval_model(label, family, h, yhat, y, ybench, tdates):
+def eval_model(label, family, h, yhat, y, ybench, tdates,
+               yhat_bc=None, ybench_bc=None, variables=""):
     e_m = yhat - y
     e_b = ybench - y
     ea_m = np.arcsinh(yhat) - np.arcsinh(y)
     ea_b = np.arcsinh(ybench) - np.arcsinh(y)
+    has_bc = yhat_bc is not None and ybench_bc is not None
+    if has_bc:
+        eb_m = np.asarray(yhat_bc, float) - y
+        eb_b = np.asarray(ybench_bc, float) - y
     rows = []
     for pn, (d0, d1) in PERIODS.items():
         sel = (tdates >= np.datetime64(d0)) & (tdates <= np.datetime64(d1))
@@ -172,6 +205,8 @@ def eval_model(label, family, h, yhat, y, ybench, tdates):
             continue
         ok_l = sel & np.isfinite(e_m) & np.isfinite(e_b)
         ok_a = sel & np.isfinite(ea_m) & np.isfinite(ea_b)
+        ok_b = (sel & np.isfinite(eb_m) & np.isfinite(eb_b)) if has_bc \
+            else np.zeros_like(sel)
         if not ok_l.any():
             continue
         # DM-HLN computed within EVERY period (unconditional test on the
@@ -185,8 +220,12 @@ def eval_model(label, family, h, yhat, y, ybench, tdates):
         dm_as = (cu.dm_hln(ea_m[ok_a], ea_b[ok_a], h)
                  if ok_a.sum() >= n_min_dm
                  else {"stat": np.nan, "pvalue": np.nan})
+        dm_bc = (cu.dm_hln(eb_m[ok_b], eb_b[ok_b], h)
+                 if ok_b.sum() >= n_min_dm
+                 else {"stat": np.nan, "pvalue": np.nan})
         rows.append({
-            "family": family, "model": label, "h": h, "period": pn,
+            "family": family, "model": label, "variables": variables,
+            "h": h, "period": pn,
             "n": int(np.sum(ok_l)),
             "rmse": rmse_(e_m[ok_l]), "rmse_bench": rmse_(e_b[ok_l]),
             "rmse_ratio": rmse_(e_m[ok_l]) / rmse_(e_b[ok_l]),
@@ -195,8 +234,13 @@ def eval_model(label, family, h, yhat, y, ybench, tdates):
             # transformed-scale observations remains in the subsample.
             "rmse_ratio_asinh": (rmse_(ea_m[ok_a]) / rmse_(ea_b[ok_a])
                                  if ok_a.any() else np.nan),
+            "mae_ratio_asinh": (mae_(ea_m[ok_a]) / mae_(ea_b[ok_a])
+                                if ok_a.any() else np.nan),
+            "rmse_bc_ratio": (rmse_(eb_m[ok_b]) / rmse_(eb_b[ok_b])
+                              if ok_b.any() else np.nan),
             "dm_stat": dm_lvl["stat"], "dm_pval": dm_lvl["pvalue"],
             "dm_stat_asinh": dm_as["stat"], "dm_pval_asinh": dm_as["pvalue"],
+            "dm_bc_stat": dm_bc["stat"], "dm_bc_pval": dm_bc["pvalue"],
         })
     return rows
 
@@ -218,15 +262,23 @@ def run_country(country):
         y = ar["y_actual"].to_numpy(float)
         yb = ar[BENCH_COL].to_numpy(float)
         td = ar["target_date"].to_numpy()
+        bench_bc = (ar["ar_dum__bc"].to_numpy(float)
+                    if "ar_dum__bc" in ar.columns else None)
         for mcol in [c for c in ar.columns
                      if c not in ("origin_date", "target_date",
                                   "y_actual", BENCH_COL)
                      and not c.endswith("__bc")]:
             ym = ar[mcol].to_numpy(float)
-            sum_rows += eval_model(mcol, "AR", h, ym, y, yb, td)
+            mdesc = AR_DESC.get(mcol, mcol)
+            mbc = (ar[f"{mcol}__bc"].to_numpy(float)
+                   if f"{mcol}__bc" in ar.columns else None)
+            sum_rows += eval_model(mcol, "AR", h, ym, y, yb, td,
+                                   yhat_bc=mbc, ybench_bc=bench_bc,
+                                   variables=mdesc)
             gr = gr_fluctuation(yb - y, ym - y, td, h)
             if gr:
-                gr_rows.append({"family": "AR", "model": mcol, "h": h, **gr})
+                gr_rows.append({"family": "AR", "model": mcol,
+                                "variables": mdesc, "h": h, **gr})
 
         for fam in _families():
             fp = os.path.join(cu.FORECAST_DIR, f"{fam}_{cc}_h{h:02d}.csv")
@@ -236,9 +288,11 @@ def run_country(country):
             fc = pd.read_csv(fp, parse_dates=["origin_date", "target_date"])
             ar_pool = [c for c in _comb_include_ar()
                        if c in ar.columns and not c.endswith("__bc")]
+            ar_bc_cols = [f"{c}__bc" for c in [BENCH_COL] + ar_pool
+                          if f"{c}__bc" in ar.columns]
             ar_cols = list(dict.fromkeys(
                 ["origin_date", "target_date", "y_actual", BENCH_COL]
-                + ar_pool))
+                + ar_pool + ar_bc_cols))
             mg = ar[ar_cols] \
                 .merge(fc.drop(columns=["y_actual"]),
                        on=["origin_date", "target_date"]) \
@@ -269,12 +323,31 @@ def run_country(country):
                          "avg_weight": aw}
                         for sname, aw in zip(specs,
                                              np.nanmean(W1, axis=0))]
+            # Bias-corrected combinations: same weights (from ordinary
+            # errors), applied to the members' __bc forecasts.
+            spec_bc_cols = [f"{sp}__bc" for sp in specs]
+            have_spec_bc = all(c in mg.columns for c in spec_bc_cols)
+            if have_spec_bc:
+                Fbc = mg[spec_bc_cols].to_numpy(float)
+                comb_eq_bc = np.nanmean(Fbc, axis=1)
+                comb_trim_bc = trim_mean_rows(Fbc)
+                comb_fam_bc = apply_weights_bc(W1, Fbc)
+            else:
+                comb_eq_bc = comb_trim_bc = comb_fam_bc = \
+                    np.full(len(y2), np.nan)
+            comb_invmse_bc = np.full(len(y2), np.nan)
+
             if ar_pool:
                 F_pool = np.column_stack(
                     [comb_invmse_fam, mg[ar_pool].to_numpy(float)])
                 comb_invmse, W2 = combine_invmse(
                     F_pool, y2, mg["origin_date"].to_numpy(), h,
                     return_weights=True)
+                pool_bc = [f"{c}__bc" for c in ar_pool]
+                if have_spec_bc and all(c in mg.columns for c in pool_bc):
+                    F_pool_bc = np.column_stack(
+                        [comb_fam_bc, mg[pool_bc].to_numpy(float)])
+                    comb_invmse_bc = apply_weights_bc(W2, F_pool_bc)
                 # Diagnostics: full stage-2 weight path (3 candidates) —
                 # shows WHEN the combination migrates to the AR and back.
                 w2 = pd.DataFrame(
@@ -286,6 +359,7 @@ def run_country(country):
                     index=False)
             else:
                 comb_invmse = comb_invmse_fam
+                comb_invmse_bc = comb_fam_bc
 
             combo = pd.DataFrame({
                 "origin_date": mg["origin_date"].dt.strftime("%Y-%m-%d"),
@@ -293,7 +367,11 @@ def run_country(country):
                 "y_actual": y2, "comb_eq": comb_eq,
                 "comb_trim": comb_trim,
                 "comb_invmse_fam": comb_invmse_fam,
-                "comb_invmse": comb_invmse})
+                "comb_invmse": comb_invmse,
+                "comb_eq__bc": comb_eq_bc,
+                "comb_trim__bc": comb_trim_bc,
+                "comb_invmse_fam__bc": comb_fam_bc,
+                "comb_invmse__bc": comb_invmse_bc})
             cfp = os.path.join(cu.FORECAST_DIR,
                                f"comb_{fam}_{cc}_h{h:02d}.csv")
             combo.to_csv(cfp, index=False)
@@ -302,23 +380,51 @@ def run_country(country):
             # labels (no selection, no "_expost" flag).  N > 0: only the N
             # best full-sample specs, "_expost"-labelled because the ranking
             # uses the whole evaluation sample (look-ahead; disclose).
+            # Spec composition lookup for the `variables` column.
+            dict_fp = os.path.join(
+                cu.FORECAST_DIR, f"{fam}_spec_dictionary_{cc}.csv")
+            spec_desc = {sp: "" for sp in specs}
+            if os.path.exists(dict_fp):
+                dd = pd.read_csv(dict_fp).fillna("")
+                for r in dd.itertuples():
+                    hf = r.hf_vars if str(r.hf_vars) else "none"
+                    lf = r.lf_vars if str(r.lf_vars) else "none"
+                    spec_desc[r.spec_id] = f"HF: {hf} + LF: {lf}"
+
             full_rmse = {s: rmse_(F[:, j] - y2)
                          for j, s in enumerate(specs)}
             ranked = sorted(full_rmse, key=full_rmse.get)
             all_mode = TOP_N_SPECS <= 0 or TOP_N_SPECS >= len(specs)
             sel_specs = specs if all_mode else ranked[:TOP_N_SPECS]
             best_spec = ranked[0]
-            models = {(s if all_mode else f"{s}_expost"):
-                      F[:, specs.index(s)] for s in sel_specs}
+            models, models_bc, desc = {}, {}, {}
+            for sp in sel_specs:
+                lbl = sp if all_mode else f"{sp}_expost"
+                models[lbl] = F[:, specs.index(sp)]
+                bc_col = f"{sp}__bc"
+                models_bc[lbl] = (mg[bc_col].to_numpy(float)
+                                  if bc_col in mg.columns else None)
+                desc[lbl] = spec_desc.get(sp, "")
             models.update({
                 "comb_eq": comb_eq, "comb_trim": comb_trim,
                 "comb_invmse_fam": comb_invmse_fam,
                 "comb_invmse": comb_invmse})
+            models_bc.update({
+                "comb_eq": comb_eq_bc, "comb_trim": comb_trim_bc,
+                "comb_invmse_fam": comb_fam_bc,
+                "comb_invmse": comb_invmse_bc})
+            desc.update(COMB_DESC)
+            bench_bc2 = (mg["ar_dum__bc"].to_numpy(float)
+                         if "ar_dum__bc" in mg.columns else None)
             for lbl, ym in models.items():
-                sum_rows += eval_model(lbl, fam, h, ym, y2, yb2, td2)
+                sum_rows += eval_model(lbl, fam, h, ym, y2, yb2, td2,
+                                       yhat_bc=models_bc.get(lbl),
+                                       ybench_bc=bench_bc2,
+                                       variables=desc.get(lbl, ""))
                 gr = gr_fluctuation(yb2 - y2, ym - y2, td2, h)
                 if gr:
                     gr_rows.append({"family": fam, "model": lbl,
+                                    "variables": desc.get(lbl, ""),
                                     "h": h, **gr})
             print(f"  {fam} h={h:02d}: {len(sel_specs)} specs evaluated "
                   f"(best full-sample: {best_spec}); combos written")
