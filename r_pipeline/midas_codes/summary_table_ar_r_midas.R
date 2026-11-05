@@ -73,17 +73,28 @@ dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
        dm_stat = dm$stat, dm_pval = dm$pvalue)
 }
 
+# a, b: normalised-asinh location / scale of each row's ORIGIN window (from
+# forecasts/vst_params_<cc>.csv), so transformed-scale errors are
+# asinh((y - a)/b) - asinh((yhat - a)/b) — the same scale for every model at
+# that origin.  NULL -> plain asinh (v3 behaviour).
 compute_metrics <- function(y_actual, y_hat_test, y_hat_bench, h,
-                            y_hat_test_bc = NULL, y_hat_bench_bc = NULL) {
-  ok <- is.finite(y_actual) & is.finite(y_hat_test) & is.finite(y_hat_bench)
+                            y_hat_test_bc = NULL, y_hat_bench_bc = NULL,
+                            a = NULL, b = NULL) {
+  if (is.null(a)) a <- rep(0, length(y_actual))
+  if (is.null(b)) b <- rep(1, length(y_actual))
+  ok <- is.finite(y_actual) & is.finite(y_hat_test) & is.finite(y_hat_bench) &
+        is.finite(a) & is.finite(b)
   y_a <- y_actual[ok]; y_t <- y_hat_test[ok]; y_b <- y_hat_bench[ok]
+  a_k <- a[ok]; b_k <- b[ok]
 
   e_t_p <- y_a - y_t
   e_b_p <- y_a - y_b
   rmse_lev <- .rmse_block(e_t_p, e_b_p, h)
   mae_lev  <- .mae_block (e_t_p, e_b_p, h)
 
-  ya_a <- asinh(y_a); ya_t <- asinh(y_t); ya_b <- asinh(y_b)
+  # errors on the model's own transformed scale (VST_MODE): not comparable
+  # across runs with different transformations
+  ya_a <- vst_z(y_a, a_k, b_k); ya_t <- vst_z(y_t, a_k, b_k); ya_b <- vst_z(y_b, a_k, b_k)
   e_t_a <- ya_a - ya_t
   e_b_a <- ya_a - ya_b
   rmse_a <- .rmse_block(e_t_a, e_b_a, h)
@@ -154,16 +165,24 @@ compute_metrics <- function(y_actual, y_hat_test, y_hat_bench, h,
 }
 
 FAMILY_PATTERNS <- list(
-  R_MIDAS = function(cc, h) sprintf("r_midas_%s_h%02d.csv", cc, h),
+  R_MIDAS    = function(cc, h) sprintf("r_midas_%s_h%02d.csv", cc, h),
+  # R-MIDAS with the Almon polynomial on the consecutive lags 1..7
+  R_MIDAS_L7 = function(cc, h) sprintf("r_midas_l7_%s_h%02d.csv", cc, h),
+  # Free-lag ARX control (arx_free_lags.R): same spec ids as R_MIDAS.
+  ARX        = function(cc, h) sprintf("arx_%s_h%02d.csv", cc, h),
   # Real-time combinations written by combination_subperiod_gr.R (columns
-  # comb_eq / comb_trim / comb_invmse_fam / comb_invmse).  Run the
-  # combination stage BEFORE this summary so the files exist; the family is
-  # skipped silently when they do not.
-  COMB    = function(cc, h) sprintf("comb_r_midas_%s_h%02d.csv", cc, h)
+  # comb_eq / comb_trim / comb_invmse_fam / comb_invmse), one family per
+  # estimated family.  Run the combination stage BEFORE this summary so the
+  # files exist; a family is skipped silently when they do not.
+  COMB_R_MIDAS    = function(cc, h) sprintf("comb_r_midas_%s_h%02d.csv", cc, h),
+  COMB_R_MIDAS_L7 = function(cc, h) sprintf("comb_r_midas_l7_%s_h%02d.csv", cc, h),
+  COMB_ARX        = function(cc, h) sprintf("comb_arx_%s_h%02d.csv", cc, h)
 )
 
 DICT_FILES <- c(
-  R_MIDAS = "r_midas_spec_dictionary_%s.csv"
+  R_MIDAS    = "r_midas_spec_dictionary_%s.csv",
+  R_MIDAS_L7 = "r_midas_l7_spec_dictionary_%s.csv",
+  ARX        = "arx_spec_dictionary_%s.csv"
 )
 
 process_country_h <- function(cc, h) {
@@ -175,6 +194,7 @@ process_country_h <- function(cc, h) {
   ar$target_date <- as.Date(ar$target_date)
   ar$origin_date <- as.Date(ar$origin_date)
   bench <- ar$ar_dum
+  vp <- load_vst_params(FORECAST_DIR, cc, ar$origin_date)   # (a, b) per origin
 
   rows <- list()
 
@@ -182,7 +202,8 @@ process_country_h <- function(cc, h) {
                                       grep("__bc$", colnames(ar), value = TRUE)))
   for (sp in ar_specs) {
     m <- compute_metrics(ar$y_actual, ar[[sp]], bench, h,
-                         ar[[paste0(sp, "__bc")]], ar[["ar_dum__bc"]])
+                         ar[[paste0(sp, "__bc")]], ar[["ar_dum__bc"]],
+                         a = vp$a, b = vp$b)
     rows[[length(rows) + 1L]] <- .metrics_row(cc, h, "AR", sp, m)
   }
 
@@ -201,12 +222,14 @@ process_country_h <- function(cc, h) {
     mi_a <- mi[match(common, as.character(mi$target_date)), , drop = FALSE]
     ar_a <- ar[match(common, as.character(ar$target_date)), , drop = FALSE]
     bench_a <- ar_a$ar_dum
-    col_prefix <- if (fam == "COMB") "^comb_" else "^spec_"
+    vp_a <- load_vst_params(FORECAST_DIR, cc, ar_a$origin_date)
+    col_prefix <- if (grepl("^COMB", fam)) "^comb_" else "^spec_"
     spec_cols <- grep(col_prefix, colnames(mi_a), value = TRUE)
     spec_cols <- spec_cols[!grepl("__bc$", spec_cols)]
     for (sp in spec_cols) {
       m <- compute_metrics(mi_a$y_actual, mi_a[[sp]], bench_a, h,
-                           mi_a[[paste0(sp, "__bc")]], ar_a[["ar_dum__bc"]])
+                           mi_a[[paste0(sp, "__bc")]], ar_a[["ar_dum__bc"]],
+                           a = vp_a$a, b = vp_a$b)
       rows[[length(rows) + 1L]] <- .metrics_row(cc, h, fam, sp, m)
     }
   }
@@ -215,7 +238,7 @@ process_country_h <- function(cc, h) {
 }
 
 all_rows <- list()
-for (cc in c("de", "it")) {
+for (cc in eval_countries()) {
   for (h in HORIZONS) {
     cat(sprintf("processing %s  h=%d ...\n", cc, h))
     block <- tryCatch(process_country_h(cc, h),
@@ -231,7 +254,7 @@ summary_df <- do.call(rbind, all_rows)
 
 summary_df$hf_vars <- NA_character_
 summary_df$lf_vars <- NA_character_
-for (cc in c("de", "it")) {
+for (cc in eval_countries()) {
   for (fam in names(DICT_FILES)) {
     dp <- file.path(FORECAST_DIR, sprintf(DICT_FILES[[fam]], cc))
     if (!file.exists(dp)) next
@@ -252,7 +275,7 @@ for (cc in c("de", "it")) {
 summary_df$hf_vars[is.na(summary_df$hf_vars) | !nzchar(summary_df$hf_vars)] <-
   ifelse(summary_df$family[is.na(summary_df$hf_vars) |
                            !nzchar(summary_df$hf_vars)] %in%
-           c("R_MIDAS", "RU_MIDAS", "R_MIDAS_extended", "R_MIDAS_surveys"),
+           c("R_MIDAS", "R_MIDAS_L7", "ARX", "RU_MIDAS", "R_MIDAS_extended", "R_MIDAS_surveys"),
          "none", NA_character_)
 summary_df$lf_vars[!is.na(summary_df$hf_vars) & summary_df$hf_vars == "none" &
                    (is.na(summary_df$lf_vars) | !nzchar(summary_df$lf_vars))] <- "none"
@@ -263,9 +286,9 @@ AR_DESC_S <- c(
   ar_dum_gas_brent = "AR(1,2,3,7) + calendar + gas lag1 + brent lag1"
 )
 COMB_DESC_S <- c(
-  comb_eq         = "equal-weight comb. of all R-MIDAS specs",
-  comb_trim       = "20%-trimmed-mean comb. of all R-MIDAS specs",
-  comb_invmse_fam = "inverse-MSE comb. of all R-MIDAS specs (90d trail)",
+  comb_eq         = "equal-weight comb. of all specs of the family",
+  comb_trim       = "20%-trimmed-mean comb. of all specs of the family",
+  comb_invmse_fam = "inverse-MSE comb. of all specs of the family (90d trail)",
   comb_invmse     = "two-stage inverse-MSE comb.: {family comb., ar_dum, ar_dum_gas}"
 )
 summary_df$variables <- NA_character_

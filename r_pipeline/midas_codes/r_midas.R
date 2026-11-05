@@ -25,10 +25,14 @@
 #       set as the AR benchmark, so R-MIDAS restricts exactly the block the
 #       benchmark leaves free.)
 #
-# NLS protocol: 5-start L-BFGS-B per rolling window per spec. Start 1 is the
+# NLS protocol: 7-start L-BFGS-B per rolling window per spec. Start 1 is the
 # previous origin's warm-start theta (or (0,0) initially); the remaining
 # starts are deterministic canonical Almon shapes supplied by
-# fit_r_midas_fast.R. The lowest-SSE admissible optimum is retained.
+# fit_r_midas_fast.R (flat, two U-shapes, fast/slow decay, hump). The
+# lowest-SSE admissible optimum is retained.
+# Theta box: [-8,8] x [-8, RMIDAS_THETA2_MAX] (default 8 = theta2 free, so
+# U-shaped weight profiles with a weekly revival at lag 7 are admissible;
+# RMIDAS_THETA2_MAX=0 reproduces the earlier log-concave restriction).
 #
 # Iterated multi-step (option c.1):
 #   * y AR-Almon: history_y_aug fed back through fixed θ_y Almon weights
@@ -40,9 +44,22 @@
 # OUTPUTS:
 #   forecasts/r_midas_<cc>_h<h>.csv              forecasts per horizon
 #   forecasts/r_midas_spec_dictionary_<cc>.csv   spec → variable membership
+#   forecasts/r_midas_<cc>_h<h>_sd.csv           predictive sd (asinh scale)
+#                                                of the h-step Gaussian
+#                                                density, per spec (input of
+#                                                density_eval.R)
 #   results/coefficients/r_midas_<cc>.csv        rolling-window coefficients
 #                                                (wide format: origin_date,
-#                                                spec_id, delta_y, <each LF>)
+#                                                spec_id, delta_y, theta1,
+#                                                theta2, phi_1 phi_2 phi_3
+#                                                phi_7 = implied AR coefs
+#                                                delta*b(j;theta),
+#                                                min_root_mod = stability
+#                                                diagnostic (> 1 = stationary),
+#                                                at_bound / flag_delta_small /
+#                                                flag_degenerate / convergence
+#                                                = optimizer + identification
+#                                                flags, <each LF>)
 # =============================================================================
 
 args <- commandArgs(trailingOnly = FALSE)
@@ -60,6 +77,18 @@ source(file.path(script_dir, "common_utils.R"))
 source(file.path(script_dir, "fit_r_midas_fast.R"))
 fit_r_midas <- fit_r_midas_fast
 
+# Family parametrisation (r_midas_l7.R sets these before sourcing this file):
+#   RMIDAS_LAGS   lag set of the exp-Almon block ("1,2,3,7" = standard R-MIDAS
+#                 on the benchmark's gappy set; "1:7" = consecutive lags 1..7,
+#                 family R_MIDAS_L7)
+#   RMIDAS_PREFIX file prefix of every output (r_midas | r_midas_l7)
+#   RMIDAS_FAMILY label used in the summaries
+.parse_lags <- function(x) if (grepl(":", x)) eval(parse(text = x)) else
+  as.integer(strsplit(x, ",")[[1]])
+RM_LAGS   <- as.integer(.parse_lags(Sys.getenv("RMIDAS_LAGS", "1,2,3,7")))
+RM_PREFIX <- Sys.getenv("RMIDAS_PREFIX", "r_midas")
+RM_FAMILY <- Sys.getenv("RMIDAS_FAMILY", "R_MIDAS")
+
 DATA_DIR     <- file.path(script_dir, "data")
 FORECAST_DIR <- file.path(script_dir, "forecasts")
 COEF_DIR     <- file.path(script_dir, "results", "coefficients")
@@ -69,7 +98,9 @@ dir.create(COEF_DIR,     showWarnings = FALSE, recursive = TRUE)
 Q_AR             <- Q_HF
 SPEC_LIMIT       <- suppressWarnings(as.integer(Sys.getenv("SPEC_LIMIT", "256")))
 if (is.na(SPEC_LIMIT) || SPEC_LIMIT <= 0L) SPEC_LIMIT <- 256L
-N_STARTS_R_MIDAS <- 5L
+# 7 starts = warm start + 6 canonical shapes (flat, two U-shapes, fast and
+# slow decay, hump) so that both log-convex restarts are always tried.
+N_STARTS_R_MIDAS <- 7L
 
 # Exponentially discounted (weighted) least squares, applied IDENTICALLY to
 # both countries so the methodology stays symmetric.  Rows of the estimation
@@ -88,41 +119,58 @@ DISCOUNT_LAMBDA <- suppressWarnings(as.numeric(Sys.getenv("RMIDAS_DISCOUNT", "1"
 if (!is.finite(DISCOUNT_LAMBDA) || DISCOUNT_LAMBDA <= 0 || DISCOUNT_LAMBDA > 1)
   DISCOUNT_LAMBDA <- 1
 
+# Upper bound on theta2 of the exp-Almon exponent.  DEFAULT 8: the box is
+# [-8,8]^2 (bounded for numerical stability only), admitting log-CONVEX
+# (U-shaped) profiles — high lag 1, dip at lags 2-3, weekly revival at lag 7
+# — which the free-AR dynamics of BOTH countries favour (the former bound
+# theta2 <= 0 was binding in ~100% of Italian windows and zeroed the weekly
+# lag).  RMIDAS_THETA2_MAX=0 reproduces the earlier log-concave restriction
+# (flat / decaying / single hump).  Applied identically to both countries.
+THETA2_MAX <- suppressWarnings(as.numeric(Sys.getenv("RMIDAS_THETA2_MAX", "8")))
+if (!is.finite(THETA2_MAX)) THETA2_MAX <- 8
+THETA_LOWER <- c(-8, -8)
+THETA_UPPER <- c(8, THETA2_MAX)
+BOUND_TOL   <- 1e-3      # |theta - bound| below this counts as "at the bound"
+DELTA_SMALL <- 0.05      # |delta_y| below this: theta weakly identified
+W_DEGENERATE <- 0.99     # max Almon weight above this: all mass on one lag
+
 # -----------------------------------------------------------------------------
 # RUNNER
 # -----------------------------------------------------------------------------
 run_r_midas <- function(country) {
   n_cores <- get_n_cores()
-  cat(sprintf("\n=== R-MIDAS standard (Almon on y, linear HF) — %s (n_cores=%d, n_starts=%d) ===\n",
-              country, n_cores, N_STARTS_R_MIDAS))
+  cat(sprintf("\n=== %s (Almon on y lags {%s}, linear HF) — %s (n_cores=%d, n_starts=%d, theta2_max=%g, vst=%s) ===\n",
+              RM_FAMILY, paste(RM_LAGS, collapse = ","), country, n_cores,
+              N_STARTS_R_MIDAS, THETA2_MAX, VST_MODE))
   cc      <- if (country == "Germany") "de" else "it"
   dat     <- load_country_data(country, DATA_DIR)
   daily   <- dat$daily
   monthly <- dat$monthly
   dates   <- daily$date
   n       <- nrow(daily)
-  y       <- daily$y_asinh
+  P       <- daily$elec_price              # RAW prices; normalised asinh per window
 
-  # Almon AR block of y over the lag set J = {1, 2, 3, 7} (model.tex)
-  ar_mat <- build_ar_lags(y, AR_LAGS)
+  # Almon AR block over the lag set RM_LAGS (raw lagged prices, transformed
+  # per origin with that window's (a, b))
+  ar_mat <- build_ar_lags(P, RM_LAGS)
   Z_full <- list(y_lags = ar_mat)
-  AR_LAG_SETS <- list(y_lags = AR_LAGS)
+  AR_LAG_SETS <- list(y_lags = RM_LAGS)
 
   # Single-lag HF exo
   gas_lag1 <- c(NA_real_, daily$gas_log[1:(n - 1L)])
   brt_lag1 <- c(NA_real_, daily$brent_log[1:(n - 1L)])
 
-  # LF (daily, publication-aware LOCF)
+  # LF (daily, release-aware: each monthly value becomes usable on its
+  # release date and is carried forward until the next release — see
+  # make_daily_lf in common_utils.R)
   lf_names <- if (country == "Germany") LF_CANDIDATES_DE else LF_CANDIDATES_IT
-  lf_pub   <- c(
-    pmi_mfg_de = PUB_LAG_SURVEY, pmi_serv_de = PUB_LAG_SURVEY, ifo_bci_de = PUB_LAG_SURVEY,
-    pmi_mfg_it = PUB_LAG_SURVEY, pmi_serv_it = PUB_LAG_SURVEY, istat_bci_it = PUB_LAG_SURVEY,
-    Consumer_Goods = PUB_LAG_IPI, Manufacturing = PUB_LAG_IPI, Energy = PUB_LAG_IPI
-  )
+  lf_pub   <- LF_PUB_LAG
   lf_mat <- matrix(NA_real_, n, length(lf_names),
                    dimnames = list(NULL, lf_names))
-  # Surveys: LOCF over missing monthly releases (original standard_midas
-  # convention); IPI: no LOCF (a missing release drops the row).
+  # The locf flag applies to the LEGACY calendar-lag mode only (surveys:
+  # carry over missing monthly values; IPI: drop the row).  In the default
+  # release-aware mode the latest released value is carried forward for
+  # every variable by construction.
   for (v in lf_names) lf_mat[, v] <- make_daily_lf(
     dates, monthly, v, lf_pub[[v]],
     locf = (lf_pub[[v]] == PUB_LAG_SURVEY))
@@ -165,23 +213,36 @@ run_r_midas <- function(country) {
     stringsAsFactors = FALSE
   )
   dict_path <- file.path(FORECAST_DIR,
-                         sprintf("r_midas_spec_dictionary_%s.csv", cc))
+                         sprintf("%s_spec_dictionary_%s.csv", RM_PREFIX, cc))
   write.csv(dict, dict_path, row.names = FALSE)
   cat(sprintf("  wrote %s  (specs = %d)\n", dict_path, nrow(dict)))
 
   origins <- make_origins(n, WINDOW_DAYS,
                           # Max lag actually used by this model: the Almon
-                          # block runs on lags {1,2,3,7} and the fuel columns
-                          # on lag 1, so 7 pre-sample days suffice (referee
-                          # point 11; was 14 via Q_HF).
-                          pre_lag_max = max(AR_LAGS),
+                          # block runs on RM_LAGS and the fuel columns on lag
+                          # 1, so max(RM_LAGS) pre-sample days suffice.
+                          pre_lag_max = max(RM_LAGS),
                           h_max = H_MAX)
   n_orig <- length(origins)
   cat(sprintf("  rolling origins: %d (from %s to %s)\n",
               n_orig, format(dates[origins[1]]),
               format(dates[origins[n_orig]])))
 
-  coef_cols <- c("delta_y", lf_names)
+  # Normalised-asinh location / scale per origin (identical to the values
+  # written by ar_benchmark.R: same windows, same prices).
+  VP <- vst_params_by_origin(P, origins, WINDOW_DAYS)
+  write.csv(data.frame(origin_date = dates[origins], a = VP$a, b = VP$b),
+            file.path(FORECAST_DIR, sprintf("vst_params_%s.csv", cc)), row.names = FALSE)
+
+  # Per-window record: total AR loading, Almon shape parameters, the implied
+  # AR coefficients phi_j = delta * b(j; theta) at every lag of RM_LAGS, the
+  # stability diagnostic, optimizer / identification flags, and the LF
+  # loadings.
+  phi_cols  <- paste0("phi_", RM_LAGS)
+  diag_cols <- c("theta1", "theta2", phi_cols, "min_root_mod",
+                 "at_bound", "flag_delta_small", "flag_degenerate",
+                 "convergence")
+  coef_cols <- c("delta_y", diag_cols, lf_names)
 
   fit_one_spec <- function(si) {
     set.seed(20240501L + si)
@@ -207,12 +268,13 @@ run_r_midas <- function(country) {
       t0 <- origins[oi]                     # row index of the forecast origin
       win_lo <- t0 - WINDOW_DAYS + 1L      # first row of the rolling window
       win_rows <- win_lo:t0                # estimation window (ends AT t0)
-      ywin <- y[win_rows]                  # response: asinh(price) in window
+      p_o  <- list(a = VP$a[oi], b = VP$b[oi])   # this window's (a, b)
+      ywin <- vst(P[win_rows], p_o)        # response: asinh((P - a)/b) in window
 
-      # Almon block: the window rows of the (n x 4) matrix whose columns are
-      # y_{t-1}, y_{t-2}, y_{t-3}, y_{t-7} (lag set J of model.tex).  The NLS
-      # will weight these 4 columns with the exp-Almon weights b(j; theta).
-      Z_list <- list(y_lags = ar_mat[win_rows, , drop = FALSE])
+      # Almon block: the window rows of the lagged-price matrix (columns =
+      # lags RM_LAGS), on the window's transformed scale.  The NLS weights
+      # these columns with the exp-Almon weights b(j; theta).
+      Z_list <- list(y_lags = vst(ar_mat[win_rows, , drop = FALSE], p_o))
 
       # Linear part of the design, assembled column-block by column-block:
       # intercept + 18 calendar dummies (always) ...
@@ -273,11 +335,13 @@ run_r_midas <- function(country) {
       # THE ESTIMATION.  Concentrated NLS (fit_r_midas_fast.R): for each
       # candidate theta the linear coefficients are profiled out by OLS and
       # the concentrated SSE is minimised over theta = (theta1, theta2) only,
-      # by L-BFGS-B on the box [-8,8] x [-8,0] (theta2 <= 0 = non-explosive
-      # weights), from the warm start + canonical shape restarts.
-      # lag_sets tells the estimator the Almon exponent uses j in {1,2,3,7}.
+      # by L-BFGS-B on the box [-8,8] x [-8, THETA2_MAX] (stability of the
+      # implied AR dynamics is checked separately via min_root_mod below),
+      # from the warm start + canonical shape restarts.
+      # lag_sets tells the estimator the Almon exponent uses j in RM_LAGS.
       fit <- fit_r_midas(yfit, Z_fit, Xlin_fit,
                          theta_init  = theta_warm,
+                         theta_upper_block = THETA_UPPER,
                          optim_maxit = 2000L,
                          optim_factr = 5e8,
                          n_starts    = N_STARTS_R_MIDAS,
@@ -294,7 +358,7 @@ run_r_midas <- function(country) {
       # sqrt(w)-scaled rows (WLS = OLS on scaled data; same trick as the
       # discount).  Warm-started single-start refit, so cost ~ one extra fit.
       if (HUBER_ON) {
-        w_alm  <- exp_almon_weights_j(AR_LAGS, fit$theta["y_lags", ])
+        w_alm  <- exp_almon_weights_j(RM_LAGS, fit$theta["y_lags", ])
         z_in   <- as.numeric(Z_fit$y_lags %*% w_alm)
         yhat_in <- as.numeric(cbind(Xlin_fit, z_in) %*%
                               c(fit$beta_lin, fit$delta["y_lags"]))
@@ -305,6 +369,7 @@ run_r_midas <- function(country) {
                               lapply(Z_fit, function(M) M * swh),
                               Xlin_fit * swh,
                               theta_init  = as.numeric(t(fit$theta)),
+                              theta_upper_block = THETA_UPPER,
                               optim_maxit = 2000L,
                               optim_factr = 5e8,
                               n_starts    = 1L,
@@ -318,21 +383,37 @@ run_r_midas <- function(country) {
       # (a) Recompute the one-step residual variance on the ORIGINAL,
       #     unweighted observations at the final coefficients (identical to
       #     fit$sigma2 when discounting and Huber are off).
-      w_bc   <- exp_almon_weights_j(AR_LAGS, fit$theta["y_lags", ])
+      w_bc   <- exp_almon_weights_j(RM_LAGS, fit$theta["y_lags", ])
       z_bc   <- as.numeric(Zraw %*% w_bc)
       res_bc <- yfit_raw - as.numeric(cbind(Xlin_raw, z_bc) %*%
                                       c(fit$beta_lin, fit$delta["y_lags"]))
       # (b) Propagate to each horizon through the fitted AR dynamics: the
       #     implied AR coefficients are phi_j = delta * b(j; theta_hat) at
-      #     lags j in {1,2,3,7}; sigma2_h = sigma2 * sum_{s<h} psi_s^2.
+      #     lags j in RM_LAGS; sigma2_h = sigma2 * sum_{s<h} psi_s^2.
       phi_bc <- as.numeric(fit$delta["y_lags"]) * w_bc
-      sigma2_mat[oi, ] <- iterated_error_variance(AR_LAGS, phi_bc,
+      sigma2_mat[oi, ] <- iterated_error_variance(RM_LAGS, phi_bc,
                                                   mean(res_bc^2), H_MAX)
 
       # Record the rolling coefficients: delta = total AR loading (the Almon
       # weights sum to 1, so delta is the sum of the four implied AR
-      # coefficients) and the free loading of each LF variable.
-      coef_mat[oi, "delta_y"] <- fit$delta["y_lags"]
+      # coefficients) and the free loading of each LF variable.  Also record
+      # the stability diagnostic: the minimum root modulus of the
+      # characteristic polynomial of the implied AR coefficients phi_j =
+      # delta_y * b_j(theta_hat) (> 1 = stationary window).
+      th <- as.numeric(fit$theta["y_lags", ])
+      coef_mat[oi, "delta_y"]      <- fit$delta["y_lags"]
+      coef_mat[oi, c("theta1", "theta2")] <- th
+      coef_mat[oi, phi_cols]       <- phi_bc
+      coef_mat[oi, "min_root_mod"] <- ar_min_root_modulus(RM_LAGS, phi_bc)
+      # Optimizer at the box boundary (a warm start can keep later windows in
+      # a corner, so this is logged per window and summarised per country).
+      coef_mat[oi, "at_bound"] <- as.integer(
+        any(abs(th - THETA_LOWER) < BOUND_TOL | abs(th - THETA_UPPER) < BOUND_TOL))
+      # Identification flags: theta is not identified when delta ~ 0, and the
+      # SSE surface is flat when all the weight sits on a single lag.
+      coef_mat[oi, "flag_delta_small"] <- as.integer(abs(fit$delta[["y_lags"]]) < DELTA_SMALL)
+      coef_mat[oi, "flag_degenerate"]  <- as.integer(max(w_bc) > W_DEGENERATE)
+      coef_mat[oi, "convergence"]      <- fit$convergence
       if (length(lf_used) > 0L) {
         for (v in lf_used) {
           b <- fit$beta_lin[v]
@@ -380,7 +461,7 @@ run_r_midas <- function(country) {
         Z_list_full     = Z_full,
         X_lin_row       = X_lin_row,
         X_lin_colnames  = names(X_lin_row),
-        history_y_aug   = y[1:t0],
+        history_y_aug   = vst(P[1:t0], p_o),   # past prices on the origin's scale
         origin_idx      = t0,
         target_dates    = target_dates,
         ar_block_name   = "y_lags",
@@ -401,15 +482,15 @@ run_r_midas <- function(country) {
 
   for (h in HORIZONS) {
     yhat_h_mat <- vapply(seq_along(spec_ids),
-                         function(si) sinh(spec_results[[si]]$yhat_mat[, h]),
-                         numeric(n_orig))
+                         function(si) vst_inv(spec_results[[si]]$yhat_mat[, h], VP),
+                         numeric(n_orig))                   # median forecast, EUR/MWh
     colnames(yhat_h_mat) <- spec_ids
-    # Feasible origin-by-origin inverse-asinh correction using the residual
-    # variance estimated inside that origin's rolling estimation window.
+    # Feasible origin-by-origin inverse-transform correction using the
+    # residual variance estimated inside that origin's rolling window.
     yhat_bc_mat <- vapply(seq_along(spec_ids), function(si) {
       mu <- spec_results[[si]]$yhat_mat[, h]
       s2 <- spec_results[[si]]$sigma2[, h]   # h-step error variance
-      sinh(mu) * exp(s2 / 2)
+      vst_inv(mu, VP, s2)                    # mean forecast, EUR/MWh
     }, numeric(n_orig))
     colnames(yhat_bc_mat) <- paste0(spec_ids, "__bc")
     out <- data.frame(
@@ -420,11 +501,28 @@ run_r_midas <- function(country) {
     )
     out <- cbind(out, as.data.frame(yhat_h_mat, stringsAsFactors = FALSE),
                  as.data.frame(yhat_bc_mat, stringsAsFactors = FALSE))
-    out <- out[!is.na(out$y_actual), , drop = FALSE]
+    keep_rows <- !is.na(out$y_actual)
+    out <- out[keep_rows, , drop = FALSE]
     fp  <- file.path(FORECAST_DIR,
-                     sprintf("r_midas_%s_h%02d.csv", cc, h))
+                     sprintf("%s_%s_h%02d.csv", RM_PREFIX, cc, h))
     write.csv(out, fp, row.names = FALSE)
     cat(sprintf("  wrote %s  (rows = %d)\n", fp, nrow(out)))
+
+    # Predictive standard deviation (transformed scale) of the h-step
+    # Gaussian density N(mu_h, sigma2_h) per spec: input of the density
+    # evaluation (log score / CRPS / ACPS on the price scale).
+    sd_mat <- vapply(seq_along(spec_ids),
+                     function(si) sqrt(spec_results[[si]]$sigma2[, h]),
+                     numeric(n_orig))
+    colnames(sd_mat) <- spec_ids
+    sd_out <- cbind(data.frame(origin_date = dates[origins],
+                               target_date = dates[origins + h],
+                               stringsAsFactors = FALSE),
+                    as.data.frame(sd_mat, stringsAsFactors = FALSE))
+    sd_out <- sd_out[keep_rows, , drop = FALSE]
+    fp_sd <- file.path(FORECAST_DIR,
+                       sprintf("%s_%s_h%02d_sd.csv", RM_PREFIX, cc, h))
+    write.csv(sd_out, fp_sd, row.names = FALSE)
   }
 
   coef_blocks <- vector("list", length(spec_ids))
@@ -441,14 +539,30 @@ run_r_midas <- function(country) {
   coef_df <- do.call(rbind, coef_blocks)
   all_na <- rowSums(is.na(coef_df[, coef_cols, drop = FALSE])) == length(coef_cols)
   coef_df <- coef_df[!all_na, , drop = FALSE]
-  coef_path <- file.path(COEF_DIR, sprintf("r_midas_%s.csv", cc))
+  coef_path <- file.path(COEF_DIR, sprintf("%s_%s.csv", RM_PREFIX, cc))
   write.csv(coef_df, coef_path, row.names = FALSE)
   cat(sprintf("  wrote %s  (rows = %d, cols = %d)\n",
               coef_path, nrow(coef_df), ncol(coef_df)))
+
+  # Almon-shape / optimizer diagnostics across all (origin, spec) windows.
+  pct <- function(x) sprintf("%.1f%%", 100 * mean(x, na.rm = TRUE))
+  cat(sprintf(paste0(
+    "  theta diagnostics (%d windows): U-shape (theta2 > 0) %s | ",
+    "at box bound %s | delta_small %s | degenerate weights %s | ",
+    "optim code 1 (iteration limit) %s\n",
+    "  median theta = (%.2f, %.2f); median implied phi(", paste(RM_LAGS, collapse = ","), ") = (%s); ",
+    "median delta = %.3f; min root modulus < 1 in %s\n"),
+    nrow(coef_df), pct(coef_df$theta2 > 0), pct(coef_df$at_bound == 1L),
+    pct(coef_df$flag_delta_small == 1L), pct(coef_df$flag_degenerate == 1L),
+    pct(coef_df$convergence == 1L),
+    median(coef_df$theta1, na.rm = TRUE), median(coef_df$theta2, na.rm = TRUE),
+    paste(sprintf("%.3f", vapply(phi_cols, function(cn) median(coef_df[[cn]], na.rm = TRUE),
+                                 numeric(1))), collapse = ", "),
+    median(coef_df$delta_y, na.rm = TRUE), pct(coef_df$min_root_mod < 1)))
 }
 
 country_arg <- Sys.getenv("COUNTRY_NAME", unset = "ALL")
 countries   <- if (toupper(country_arg) == "ALL")
   c("Germany", "Italy") else country_arg
 for (cc_ in countries) run_r_midas(cc_)
-cat("\nR-MIDAS standard (Almon on y, linear HF) done.\n")
+cat(sprintf("\n%s (Almon on y lags {%s}, linear HF) done.\n", RM_FAMILY, paste(RM_LAGS, collapse = ",")))

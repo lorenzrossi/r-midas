@@ -198,13 +198,22 @@ gr_fluctuation <- function(e_bench, e_model, tdates, h, mu = GR_MU) {
 #                         every output row (specs: their variable subset;
 #                         AR models: their content; combinations: an
 #                         explicit description of the weighting scheme).
+#   a, b                : normalised-asinh location / scale of each row's
+#                         origin window (transformed-scale errors are
+#                         asinh((. - a)/b) differences; NULL = plain asinh).
+#   Also reports the Giacomini-White (2006) conditional test (instruments:
+#   constant and d_{t-h}) in every period, on squared and absolute errors,
+#   EUR and transformed scale; d_{t-h} is built on the FULL origin sequence
+#   and the period is applied afterwards (keep).
 eval_model <- function(label, family, h, yhat, y, ybench, tdates,
                        yhat_bc = NULL, ybench_bc = NULL,
-                       variables = "") {
+                       variables = "", a = NULL, b = NULL) {
+  if (is.null(a)) a <- rep(0, length(y))
+  if (is.null(b)) b <- rep(1, length(y))
   e_m <- yhat - y
   e_b <- ybench - y
-  ea_m <- asinh(yhat) - asinh(y)
-  ea_b <- asinh(ybench) - asinh(y)
+  ea_m <- vst_z(yhat, a, b) - vst_z(y, a, b)        # model's own transformed scale
+  ea_b <- vst_z(ybench, a, b) - vst_z(y, a, b)
   has_bc <- !is.null(yhat_bc) && !is.null(ybench_bc)
   if (has_bc) {
     eb_m <- yhat_bc - y
@@ -235,6 +244,13 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates,
     dm_bc  <- if (any(ok_bc) && sum(ok_bc) >= n_min_dm)
       dm_hln(eb_m[ok_bc], eb_b[ok_bc], h) else
       list(stat = NA_real_, pvalue = NA_real_)
+    dm_mae <- if (sum(ok_lvl) >= n_min_dm)
+      dm_hln(e_m[ok_lvl], e_b[ok_lvl], h, loss = "abserr") else
+      list(stat = NA_real_, pvalue = NA_real_)
+    gw_sq  <- gw_test(e_m, e_b, h, "sqerr",  keep = ok_lvl)
+    gw_ab  <- gw_test(e_m, e_b, h, "abserr", keep = ok_lvl)
+    gw_sqa <- gw_test(ea_m, ea_b, h, "sqerr",  keep = ok_as)
+    gw_aba <- gw_test(ea_m, ea_b, h, "abserr", keep = ok_as)
     rows[[pn]] <- data.frame(
       family = family, model = label, variables = variables,
       h = h, period = pn,
@@ -252,8 +268,13 @@ eval_model <- function(label, family, h, yhat, y, ybench, tdates,
       rmse_bc_ratio = if (any(ok_bc))
         rmse_(eb_m[ok_bc]) / rmse_(eb_b[ok_bc]) else NA_real_,
       dm_stat = dm_lvl$stat, dm_pval = dm_lvl$pvalue,
+      dm_mae_stat = dm_mae$stat, dm_mae_pval = dm_mae$pvalue,
       dm_stat_asinh = dm_as$stat, dm_pval_asinh = dm_as$pvalue,
       dm_bc_stat = dm_bc$stat, dm_bc_pval = dm_bc$pvalue,
+      gw_stat = gw_sq$stat, gw_pval = gw_sq$pvalue, gw_dbar = gw_sq$dbar,
+      gw_mae_stat = gw_ab$stat, gw_mae_pval = gw_ab$pvalue, gw_mae_dbar = gw_ab$dbar,
+      gw_stat_asinh = gw_sqa$stat, gw_pval_asinh = gw_sqa$pvalue, gw_dbar_asinh = gw_sqa$dbar,
+      gw_mae_stat_asinh = gw_aba$stat, gw_mae_pval_asinh = gw_aba$pvalue, gw_mae_dbar_asinh = gw_aba$dbar,
       stringsAsFactors = FALSE
     )
   }
@@ -308,11 +329,14 @@ run_country <- function(country) {
     ar$origin_date <- as.Date(ar$origin_date)
     ar$target_date <- as.Date(ar$target_date)
     if (!BENCH_COL %in% names(ar)) stop("Benchmark column not found: ", BENCH_COL)
+    ar <- ar[order(ar$origin_date), , drop = FALSE]        # consecutive origins (GW lag)
+    vp <- load_vst_params(FORECAST_DIR, cc, ar$origin_date)
+    ar$vst_a <- vp$a; ar$vst_b <- vp$b
 
     # AR variants vs ar_dum (bc columns passed when present in the CSV)
     bench_bc <- if ("ar_dum__bc" %in% names(ar)) ar[["ar_dum__bc"]] else NULL
     for (mcol in setdiff(names(ar), c("origin_date", "target_date",
-                                      "y_actual", BENCH_COL,
+                                      "y_actual", BENCH_COL, "vst_a", "vst_b",
                                       grep("__bc$", names(ar), value = TRUE)))) {
       mdesc <- if (mcol %in% names(AR_DESC)) AR_DESC[[mcol]] else mcol
       mbc   <- if (paste0(mcol, "__bc") %in% names(ar))
@@ -321,7 +345,7 @@ run_country <- function(country) {
         eval_model(mcol, "AR", h, ar[[mcol]], ar$y_actual,
                    ar[[BENCH_COL]], ar$target_date,
                    yhat_bc = mbc, ybench_bc = bench_bc,
-                   variables = mdesc)
+                   variables = mdesc, a = ar$vst_a, b = ar$vst_b)
       gr <- gr_fluctuation(ar[[BENCH_COL]] - ar$y_actual,
                            ar[[mcol]] - ar$y_actual, ar$target_date, h)
       if (!is.null(gr))
@@ -345,7 +369,7 @@ run_country <- function(country) {
       # the bc metric block).
       ar_bc_cols <- intersect(paste0(c(BENCH_COL, ar_pool), "__bc"), names(ar))
       mg <- merge(ar[, unique(c("origin_date", "target_date", "y_actual",
-                                BENCH_COL, ar_pool, ar_bc_cols))],
+                                BENCH_COL, ar_pool, ar_bc_cols, "vst_a", "vst_b"))],
                   fc[, setdiff(names(fc), "y_actual")],
                   by = c("origin_date", "target_date"))
       mg <- mg[order(mg$origin_date), , drop = FALSE]
@@ -483,7 +507,7 @@ run_country <- function(country) {
         sum_rows[[length(sum_rows) + 1L]] <-
           eval_model(lbl, fam, h, models[[lbl]], y, yb, td,
                      yhat_bc = models_bc[[lbl]], ybench_bc = bench_bc2,
-                     variables = desc[[lbl]])
+                     variables = desc[[lbl]], a = mg$vst_a, b = mg$vst_b)
         gr <- gr_fluctuation(yb - y, models[[lbl]] - y, td, h)
         if (!is.null(gr))
           gr_rows[[length(gr_rows) + 1L]] <-

@@ -2,9 +2,10 @@
 # v2 PIPELINE — COMMON UTILITIES
 #
 # Loads daily prices (y = elec, X_HF = gas, brent) and monthly LF blocks for
-# Germany or Italy, applies the agreed transformations, builds publication-
-# aware daily LF series via LOCF on the (pub_lag-shifted) monthly index, and
-# exposes helpers used by ar_benchmark.R, ru_midas.R (Cimadomo principal),
+# Germany or Italy, applies the agreed transformations, builds RELEASE-AWARE
+# daily LF series (each monthly value becomes usable on its release date —
+# exact or conventional — and is carried forward until the next release; see
+# make_daily_lf), and exposes helpers used by ar_benchmark.R, ru_midas.R (Cimadomo principal),
 # r_midas.R (Almon-on-y-only), r_midas_extended.R (Almon on y AND HF) and
 # r_midas_legacy.R (Almon-on-y-only, legacy-style NLS).
 #
@@ -93,8 +94,135 @@ PUB_LAG_SURVEY <- 1L
 HF_CANDIDATES  <- c("gas", "brent")
 LF_CANDIDATES_DE <- c("pmi_mfg_de", "pmi_serv_de", "ifo_bci_de",
                       "Consumer_Goods", "Manufacturing", "Energy")
-LF_CANDIDATES_IT <- c("pmi_mfg_it", "pmi_serv_it", "istat_bci_it",
+# Italian survey indicator (v4): the ISTAT economic sentiment indicator
+# (iesi_it, composite) by default; LF_IT_SURVEY=istat_bci_it switches back to
+# the manufacturing confidence climate (robustness run / v3 data).
+LF_IT_SURVEY <- Sys.getenv("LF_IT_SURVEY", unset = "iesi_it")
+if (!LF_IT_SURVEY %in% c("iesi_it", "istat_bci_it")) LF_IT_SURVEY <- "iesi_it"
+LF_CANDIDATES_IT <- c("pmi_mfg_it", "pmi_serv_it", LF_IT_SURVEY,
                       "Consumer_Goods", "Manufacturing", "Energy")
+# Publication-lag class of every monthly indicator (used by the legacy
+# calendar-lag mode of make_daily_lf and for the survey / IPI distinction).
+LF_PUB_LAG <- c(
+  pmi_mfg_de = PUB_LAG_SURVEY, pmi_serv_de = PUB_LAG_SURVEY, ifo_bci_de = PUB_LAG_SURVEY,
+  pmi_mfg_it = PUB_LAG_SURVEY, pmi_serv_it = PUB_LAG_SURVEY,
+  istat_bci_it = PUB_LAG_SURVEY, iesi_it = PUB_LAG_SURVEY,
+  Consumer_Goods = PUB_LAG_IPI, Manufacturing = PUB_LAG_IPI, Energy = PUB_LAG_IPI
+)
+
+# -----------------------------------------------------------------------------
+# 1b. VARIANCE-STABILISING TRANSFORM z = g(P).  Every model is linear and
+#     Gaussian on the z scale; VST_MODE selects g:
+#       normalized  asinh((P - a)/b), a = median, b = MAD of the rolling
+#                   window (Uniejewski-Weron-Ziel 2018; v4 default, no
+#                   look-ahead: (a, b) use data up to the origin only)
+#       asinh       asinh(P)        (v3 transform; alias "raw")
+#       log         log(P)          (positive prices only)
+#       level       P               (no transform, no retransformation bias)
+#     Median forecast = g^-1(mu); mean forecast ("__bc") uses the h-step
+#     variance s2 on the z scale: E[a + b sinh z] = a + b sinh(mu) e^{s2/2},
+#     E[e^z] = e^{mu + s2/2}, level: mu.  (a, b) are 0, 1 outside normalized.
+# -----------------------------------------------------------------------------
+VST_MODE <- tolower(Sys.getenv("VST_MODE", unset = "normalized"))
+if (VST_MODE == "raw") VST_MODE <- "asinh"                       # backward-compatible alias
+stopifnot(VST_MODE %in% c("normalized", "asinh", "log", "level"))
+vst_params <- function(P) {
+  if (VST_MODE != "normalized") return(list(a = 0, b = 1))      # (a, b) only used by normalized
+  a <- stats::median(P, na.rm = TRUE)
+  b <- stats::mad(P, na.rm = TRUE)              # already scaled by 1.4826
+  if (!is.finite(b) || b <= 0) b <- stats::sd(P, na.rm = TRUE)
+  if (!is.finite(b) || b <= 0) b <- 1
+  list(a = a, b = b)
+}
+vst <- function(P, p) switch(VST_MODE,
+  normalized = asinh((P - p$a) / p$b),
+  asinh      = asinh(P),
+  log        = { if (any(P <= 0, na.rm = TRUE)) stop("VST_MODE=log needs strictly positive prices"); log(P) },
+  level      = P)
+# p$a / p$b may be vectors (one pair per origin) aligned with z.
+# s2 = h-step variance on the z scale; s2 = 0 gives the median, s2 > 0 the mean.
+vst_inv <- function(z, p, s2 = 0) switch(VST_MODE,
+  normalized = p$a + p$b * sinh(z) * exp(s2 / 2),
+  asinh      = sinh(z) * exp(s2 / 2),
+  log        = exp(z + s2 / 2),
+  level      = z + 0 * s2)
+# inverse WITHOUT mean correction, vectorised over matrices (quantiles, grids);
+# a, b per origin (recycled down the rows of a matrix)
+vst_inv0 <- function(z, a, b) switch(VST_MODE,
+  normalized = a + b * sinh(z), asinh = sinh(z), log = exp(z), level = z)
+# log g'(u): Jacobian of the density on the price scale (log score)
+vst_logjac <- function(u, a, b) switch(VST_MODE,
+  normalized = -0.5 * log((u - a)^2 + b^2),
+  asinh      = -0.5 * log(u^2 + 1),
+  log        = ifelse(u > 0, -log(u), -Inf),
+  level      = 0 * u)
+# z of a price, vectorised with per-origin (a, b)
+vst_z <- function(u, a, b) switch(VST_MODE,
+  normalized = asinh((u - a) / b), asinh = asinh(u),
+  log = ifelse(u > 0, log(pmax(u, 1e-12)), -Inf), level = u)
+
+# Countries evaluated by the post-estimation stages (follows COUNTRY_NAME so
+# an Italy-only folder does not look for German forecasts).
+eval_countries <- function() switch(Sys.getenv("COUNTRY_NAME", unset = "ALL"),
+  Germany = "de", Italy = "it", c("de", "it"))
+
+# -----------------------------------------------------------------------------
+# 1c. EXACT CRPS of the price-scale predictive distribution, z ~ N(mu, s2)
+#     on the g scale.  Closed forms for level (Gaussian) and log (lognormal,
+#     Baran-Lerch 2015); quantile representation (Laio-Tamea 2007)
+#       CRPS = 2 int_0^1 (1{y < Q(tau)} - tau)(Q(tau) - y) dtau
+#     with a K-point midpoint rule for normalized / asinh (no closed form).
+# -----------------------------------------------------------------------------
+crps_norm  <- function(y, mu, s) { z <- (y - mu) / s; s * (z * (2 * pnorm(z) - 1) + 2 * dnorm(z) - 1 / sqrt(pi)) }
+crps_lnorm <- function(y, mu, s) {                  # y > 0
+  w <- (log(y) - mu) / s
+  y * (2 * pnorm(w) - 1) - 2 * exp(mu + s^2 / 2) * (pnorm(w - s) + pnorm(s / sqrt(2)) - 1)
+}
+CRPS_K   <- suppressWarnings(as.integer(Sys.getenv("CRPS_K", "1000")))
+if (is.na(CRPS_K) || CRPS_K < 50L) CRPS_K <- 1000L
+CRPS_TAU <- (seq_len(CRPS_K) - 0.5) / CRPS_K       # midpoint rule
+CRPS_ZQ  <- qnorm(CRPS_TAU)
+crps_quantile <- function(y, mu, s, a, b, chunk = 500L) {
+  n <- length(y); out <- numeric(n)
+  if (length(a) == 1L) a <- rep(a, n)
+  if (length(b) == 1L) b <- rep(b, n)
+  for (st in seq(1L, n, by = chunk)) {               # chunks keep memory at chunk x K
+    i <- st:min(n, st + chunk - 1L)
+    Q <- vst_inv0(outer(mu[i], rep(1, CRPS_K)) + outer(s[i], CRPS_ZQ), a[i], b[i])
+    I <- Q > y[i]                                    # y < Q(tau)
+    out[i] <- 2 * rowMeans((I - rep(CRPS_TAU, each = length(i))) * (Q - y[i]))
+  }
+  out
+}
+crps_exact <- function(y, mu, s, a, b) switch(VST_MODE,
+  level = crps_norm(y, mu, s),
+  log   = crps_lnorm(y, mu, s),
+  crps_quantile(y, mu, s, a, b))                     # normalized / asinh
+# Gaussian log predictive density of price y (median forecast point, sd s
+# on the z scale) — the same formula as density_eval.R uses
+logscore_price <- function(y, point, s, a, b) {
+  z <- (vst_z(y, a, b) - vst_z(point, a, b)) / s
+  dnorm(z, log = TRUE) - log(s) + vst_logjac(y, a, b)
+}
+# (a, b) of every rolling window ending at the given origins.
+vst_params_by_origin <- function(P, origins, window = WINDOW_DAYS) {
+  a <- numeric(length(origins)); b <- a
+  for (i in seq_along(origins)) {
+    p <- vst_params(P[(origins[i] - window + 1L):origins[i]])
+    a[i] <- p$a; b[i] <- p$b
+  }
+  data.frame(a = a, b = b)
+}
+# Reads forecasts/vst_params_<cc>.csv and returns (a, b) aligned with the
+# given origin dates (a = 0, b = 1 when the file is absent, i.e. raw asinh).
+load_vst_params <- function(forecast_dir, cc, origin_dates) {
+  fp <- file.path(forecast_dir, sprintf("vst_params_%s.csv", cc))
+  n  <- length(origin_dates)
+  if (!file.exists(fp)) return(list(a = rep(0, n), b = rep(1, n)))
+  vp <- read.csv(fp, stringsAsFactors = FALSE)
+  i  <- match(as.character(as.Date(origin_dates)), as.character(as.Date(vp$origin_date)))
+  list(a = vp$a[i], b = vp$b[i])
+}
 
 # -----------------------------------------------------------------------------
 # 2. DATA LOADING + TRANSFORMATION
@@ -123,13 +251,17 @@ load_country_data <- function(country, data_dir) {
     if (!col %in% names(monthly)) stop("Missing monthly column: ", col)
     monthly[[col]] <- c(0, diff(log(monthly[[col]])))
   }
+  # z-score every survey column present (v4 Italy files carry both the
+  # manufacturing climate istat_bci_it and the composite iesi_it; v3 files
+  # only the former).  The candidate actually used is LF_CANDIDATES_IT.
   survey_cols <- if (country == "Germany")
     c("pmi_mfg_de", "pmi_serv_de", "ifo_bci_de") else
-    c("pmi_mfg_it", "pmi_serv_it", "istat_bci_it")
-  for (col in survey_cols) {
-    if (!col %in% names(monthly)) stop("Missing monthly column: ", col)
-    monthly[[col]] <- as.numeric(scale(monthly[[col]]))
-  }
+    intersect(c("pmi_mfg_it", "pmi_serv_it", "istat_bci_it", "iesi_it"), names(monthly))
+  required <- if (country == "Germany") survey_cols else c("pmi_mfg_it", "pmi_serv_it", LF_IT_SURVEY)
+  for (col in required)
+    if (!col %in% names(monthly)) stop("Missing monthly column: ", col,
+      " (set LF_IT_SURVEY=istat_bci_it for pre-v4 Italian files)")
+  for (col in survey_cols) monthly[[col]] <- as.numeric(scale(monthly[[col]]))
   monthly$ref_month <- as.Date(format(monthly$date, "%Y-%m-01"))
   list(daily = daily, monthly = monthly, country = country)
 }
@@ -206,6 +338,10 @@ usual_lf_release_date <- function(ref_month, lf_col) {
     day <- env_int("LF_ISTAT_BCI_DAY", 27L)
     return(roll_to_weekday(ref_month + (day - 1L), "forward"))
   }
+  if (identical(lf_col, "iesi_it")) {           # ISTAT sentiment: same release as the BCI
+    day <- env_int("LF_IESI_DAY", 27L)
+    return(roll_to_weekday(ref_month + (day - 1L), "forward"))
+  }
   if (lf_col %in% c("Consumer_Goods", "Manufacturing", "Energy")) {
     delay <- env_int("LF_IPI_DELAY_DAYS", 45L)
     return(roll_to_weekday(month_end + delay, "forward"))
@@ -255,6 +391,8 @@ make_daily_lf <- function(daily_dates, monthly_df, lf_col, pub_lag,
 
   # If two observations share a release date, retain the latest row.
   releases <- releases[!duplicated(releases$release_date, fromLast = TRUE), , drop = FALSE]
+  # Availability convention: a value released on day t is usable for
+  # forecasts produced ON day t (findInterval matches release_date <= date).
   idx <- findInterval(as.numeric(as.Date(daily_dates)),
                       as.numeric(releases$release_date))
   out <- rep(NA_real_, length(daily_dates))
@@ -291,6 +429,25 @@ iterated_error_variance <- function(ar_lags, phi, sigma2, h_max = H_MAX) {
     psi[s + 1L] <- acc
   }
   sigma2 * cumsum(psi^2)                      # sigma2_h for h = 1..h_max
+}
+
+# Stability diagnostic for the (implied) AR dynamics.  For coefficients
+# phi_j at lag positions ar_lags, the characteristic polynomial is
+#   1 - sum_j phi_j z^j
+# and the process is stationary iff ALL roots lie outside the unit circle,
+# i.e. iff the minimum root modulus is > 1.  Recorded per rolling window so
+# the persistence of the estimated dynamics can be inspected — particularly
+# useful when interpreting the multi-step bias correction, whose h-step
+# error variance depends on the implied MA weights (iterated_error_variance).
+# For R-MIDAS the implied coefficients are phi_j = delta_y * b_j(theta_hat).
+ar_min_root_modulus <- function(ar_lags, phi) {
+  if (length(phi) != length(ar_lags) || !all(is.finite(phi))) return(NA_real_)
+  cf <- numeric(max(ar_lags) + 1L)      # coefficients in increasing power of z
+  cf[1L] <- 1
+  cf[ar_lags + 1L] <- -phi
+  r <- tryCatch(polyroot(cf), error = function(e) complex(0))
+  if (!length(r)) return(NA_real_)
+  min(Mod(r))
 }
 
 # One-step Huber reweighting (used when RMIDAS_HUBER=1 in the runners).
@@ -487,6 +644,78 @@ dm_hln <- function(e1, e2, h, loss = c("sqerr", "abserr")) {
   list(stat = dm_hln, pvalue = pval, T = T_, dbar = dbar)
 }
 
+# Same HLN-corrected DM test on an ARBITRARY pair of per-period loss series
+# (e.g. negative log scores, CRPS, negative ACPS): d_t = l1_t - l2_t, so a
+# NEGATIVE statistic means model 1 has the lower loss (same sign convention
+# as dm_hln with model 1 = test model, model 2 = benchmark).
+dm_hln_loss <- function(l1, l2, h) {
+  ok <- is.finite(l1) & is.finite(l2)
+  d  <- l1[ok] - l2[ok]
+  T_ <- length(d)
+  if (T_ < 2L) return(list(stat = NA_real_, pvalue = NA_real_, T = T_, dbar = NA_real_))
+  dbar <- mean(d)
+  g0   <- mean((d - dbar)^2)
+  acov_sum <- 0
+  if (h > 1L) {
+    for (k in 1:(h - 1L)) {
+      if (k >= T_) break
+      gk <- sum((d[(k + 1L):T_] - dbar) * (d[1:(T_ - k)] - dbar)) / T_
+      acov_sum <- acov_sum + 2 * gk
+    }
+  }
+  v_d <- (g0 + acov_sum) / T_
+  if (!is.finite(v_d) || v_d <= 0) return(list(stat = NA_real_, pvalue = NA_real_, T = T_, dbar = dbar))
+  dm   <- dbar / sqrt(v_d)
+  corr <- sqrt((T_ + 1 - 2 * h + h * (h - 1) / T_) / T_)
+  stat <- dm * corr
+  list(stat = stat, pvalue = 2 * pt(-abs(stat), df = T_ - 1L), T = T_, dbar = dbar)
+}
+
+# -----------------------------------------------------------------------------
+# 6b. GIACOMINI-WHITE (2006) CONDITIONAL PREDICTIVE-ABILITY TEST
+# -----------------------------------------------------------------------------
+# Valid with a fixed-length rolling window and nested models.  Instruments:
+# the constant and d_{t-h} (only the loss differential of the forecast made
+# h days earlier has been realised at origin t).  e1 / e2 (or l1 / l2) must
+# be ordered by CONSECUTIVE daily origins over the FULL sequence; `keep`
+# selects the rows of a subperiod AFTER the lag is built, so the first h days
+# of a period use the instrument from the end of the previous one.
+# d = L(e1) - L(e2): negative dbar -> model 1 more accurate.  The statistic is
+# T m' Omega^-1 m ~ chi^2(2) under H0 (Newey-West with truncation h-1).
+gw_test_loss <- function(l1, l2, h, keep = NULL) {
+  d  <- l1 - l2
+  n  <- length(d)
+  dl <- c(rep(NA_real_, h), d[seq_len(max(n - h, 0L))])    # instrument d_{t-h}
+  Z  <- cbind(1, dl)
+  ok <- is.finite(d) & is.finite(dl)
+  if (!is.null(keep)) ok <- ok & keep
+  d <- d[ok]; Z <- Z[ok, , drop = FALSE]
+  T_ <- length(d); q <- ncol(Z)
+  if (T_ < 50L) return(list(stat = NA_real_, pvalue = NA_real_, T = T_, dbar = NA_real_))
+  Zd <- Z * d
+  m  <- colMeans(Zd)
+  Om <- crossprod(Zd) / T_
+  if (h > 1L) for (l in 1:(h - 1L)) {                       # Bartlett, truncation h-1: PSD
+    if (l >= T_) break
+    G  <- crossprod(Zd[(l + 1L):T_, , drop = FALSE], Zd[1:(T_ - l), , drop = FALSE]) / T_
+    Om <- Om + (1 - l / h) * (G + t(G))
+  }
+  stat <- tryCatch(T_ * drop(crossprod(m, solve(Om, m))), error = function(e) NA_real_)
+  list(stat = stat,
+       pvalue = if (is.finite(stat)) pchisq(stat, q, lower.tail = FALSE) else NA_real_,
+       T = T_, dbar = mean(d))
+}
+gw_test <- function(e1, e2, h, loss = c("sqerr", "abserr"), keep = NULL) {
+  loss <- match.arg(loss)
+  if (loss == "sqerr") gw_test_loss(e1^2, e2^2, h, keep) else
+    gw_test_loss(abs(e1), abs(e2), h, keep)
+}
+
+# Cumulative sum of squared-error differences (Welch-Goyal 2008 "CUSUM"
+# plot): rising = model beating the reference.
+cssed <- function(e_bench, e_model)
+  cumsum(ifelse(is.finite(e_bench) & is.finite(e_model), e_bench^2 - e_model^2, 0))
+
 # -----------------------------------------------------------------------------
 # 7. CALENDAR-COLUMN REFRESH AT TARGET ROW (used in iterated multi-step)
 # -----------------------------------------------------------------------------
@@ -558,6 +787,14 @@ exp_almon_weights <- function(Q, theta) exp_almon_weights_j(1:Q, theta)
 # Concentrated NLS for R-MIDAS, with optional multi-start L-BFGS-B
 # (Ghysels-Wright 2009 protocol).  See r_midas.R / r_midas_extended.R for
 # the per-spec callers that set n_starts and seed the random draws.
+#
+# theta box [-8, 8] x [-8, 0]: the theta2 <= 0 bound RESTRICTS THE LAG-SHAPE
+# FAMILY of the exp-Almon weights to flat / monotonically decaying /
+# single-hump profiles (no U-shapes with mass at both ends).  It is NOT a
+# stationarity condition — the weights are normalised to sum to 1 regardless,
+# and stability of the implied AR dynamics depends on the roots of the
+# characteristic polynomial of phi_j = delta * b_j(theta) (see
+# ar_min_root_modulus below).
 fit_r_midas <- function(y, Z_list, X_lin,
                         theta_init = NULL,
                         theta_lower_block = c(-8, -8),
@@ -645,12 +882,16 @@ fit_r_midas <- function(y, Z_list, X_lin,
   theta_mat <- matrix(theta_hat, nrow = K, ncol = 2L, byrow = TRUE,
                       dimnames = list(names(Z_list), c("theta1", "theta2")))
 
+  # Diagnostics: `convergence` is the raw optim() code of the retained
+  # optimum (0 = successful convergence; 1 = iteration limit reached, kept
+  # as an admissible candidate but NOT reported as converged).
   list(theta    = theta_mat,
        beta_lin = beta_lin,
        delta    = delta,
        sse      = best$value,
        sigma2   = mean(res^2),
-       converged = best$convergence %in% c(0L, 1L),
+       converged   = best$convergence == 0L,
+       convergence = best$convergence,
        n_eff    = sum(keep),
        n_starts = n_starts)
 }

@@ -13,3 +13,8 @@ Rplots.pdf
 .Rhistory
 .RData
 .Rproj.user/
+
+# Exploratory run folders (outputs only; scripts are symlinks to midas_codes)
+theta2relaxed/
+rollingwindow2years/
+results_compare/

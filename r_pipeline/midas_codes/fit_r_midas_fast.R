@@ -36,6 +36,13 @@
 # numbers of its columns (e.g. list(y_lags = c(1,2,3,7)) for the paper's
 # AR lag set J).  Defaults to consecutive 1..ncol per block.  Blocks may
 # have different numbers of columns.
+#
+# theta box [-8, 8] x [-8, 0] per block: the theta2 <= 0 bound restricts the
+# LAG-SHAPE FAMILY of the exp-Almon weights (flat, monotonically decaying or
+# single-hump profiles only).  It is NOT a stationarity condition: the
+# weights sum to 1 by construction, and stability of the implied AR dynamics
+# is a property of the roots of the characteristic polynomial of
+# phi_j = delta * b_j(theta) (see ar_min_root_modulus in common_utils.R).
 fit_r_midas_fast <- function(y, Z_list, X_lin,
                              theta_init = NULL,
                              theta_lower_block = c(-8, -8),
@@ -110,15 +117,28 @@ fit_r_midas_fast <- function(y, Z_list, X_lin,
   theta_upper <- rep(theta_upper_block, K)
   dim_theta   <- 2L * K
   if (n_starts < 1L) n_starts <- 1L
-  # Canonical exp-Almon shapes used as deterministic restarts: flat, fast
-  # geometric decay, slow decay, single hump, gentle decay.  Uniform draws
-  # over [-8,8]x[-8,0] mostly produce degenerate weight profiles (all mass on
-  # lag 1 or lag Q) in a flat region of the SSE and waste optimizer calls.
+  # Canonical exp-Almon shapes used as deterministic restarts: flat, two
+  # U-shapes (log-convex: high lag 1, dip at lags 2-3, weekly revival at
+  # lag 7 — the full-sample optima found for Italy and Germany; admissible
+  # only when the theta2 upper bound is positive), fast geometric decay,
+  # slow decay, single hump, gentle decay.  Uniform draws over the box
+  # mostly produce degenerate weight profiles (all mass on lag 1 or lag Q)
+  # in a flat region of the SSE and waste optimizer calls.
   shapes <- matrix(c( 0.0,  0.00,
+                     -3.5,  0.40,
+                     -2.8,  0.32,
                      -1.0,  0.00,
                      -0.2,  0.00,
                       0.5, -0.10,
                       0.1, -0.02), ncol = 2, byrow = TRUE)
+  # Keep only shapes inside the active theta box: with the default
+  # theta2 <= 0 restriction the U-shape row is dropped and the restart set
+  # is identical to the pre-relaxation one.
+  in_box <- shapes[, 1] >= theta_lower_block[1] &
+            shapes[, 1] <= theta_upper_block[1] &
+            shapes[, 2] >= theta_lower_block[2] &
+            shapes[, 2] <= theta_upper_block[2]
+  shapes <- shapes[in_box, , drop = FALSE]
   if (deterministic_starts)
     n_starts <- min(n_starts, 1L + nrow(shapes))   # no duplicate restarts
   starts <- matrix(NA_real_, n_starts, dim_theta)
@@ -174,12 +194,16 @@ fit_r_midas_fast <- function(y, Z_list, X_lin,
   theta_mat <- matrix(theta_hat, nrow = K, ncol = 2L, byrow = TRUE,
                       dimnames = list(names(Z_list), c("theta1", "theta2")))
 
+  # Diagnostics: `convergence` is the raw optim() code of the retained
+  # optimum (0 = successful convergence; 1 = iteration limit reached, kept
+  # as an admissible candidate but NOT reported as converged).
   list(theta     = theta_mat,
        beta_lin  = beta_lin,
        delta     = delta,
        sse       = best$value,
        sigma2    = mean(res^2),
-       converged = best$convergence %in% c(0L, 1L),
+       converged   = best$convergence == 0L,
+       convergence = best$convergence,
        n_eff     = length(yk),
        n_starts  = n_starts)
 }
