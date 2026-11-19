@@ -10,8 +10,9 @@
 #
 # What it does, per country, family and horizon:
 #
-# 1. FORECAST COMBINATION across the 256 specs (Bates-Granger 1969;
-#    Bordignon et al. 2013; averaging literature surveyed in Weron 2014):
+# 1. FORECAST COMBINATION across the specs WITH a monthly indicator (252 of
+#    256; COMB_MACRO_ONLY=1, default) (Bates-Granger 1969; Bordignon et al.
+#    2013; averaging literature surveyed in Weron 2014):
 #      comb_eq      equal-weight mean of all spec forecasts (family only)
 #      comb_trim    20%-trimmed mean (robust to bad specs; family only)
 #      comb_invmse  pool = specs + AR candidates (COMB_INCLUDE_AR, default
@@ -68,10 +69,16 @@ source(v2.boot.path)
 source(file.path(script_dir, "common_utils.R"))
 
 FORECAST_DIR <- file.path(script_dir, "forecasts")
-RESULT_DIR   <- file.path(script_dir, "results")
+RESULT_DIR   <- file.path(script_dir, Sys.getenv("RESULT_SUBDIR", "results"))
 dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 FAMILIES     <- strsplit(Sys.getenv("FAMILIES", "r_midas,r_midas_extended"), ",")[[1]]
+# Combinations average ONLY the specifications with at least one monthly
+# indicator (TODO_v4c item 4a): the daily-only specs of a family are the AR
+# models' job.  Runs made with SPEC_REQUIRE_LF=1 contain no other spec, so
+# this is a no-op there; for the older 256-spec runs it drops spec_000 /
+# _064 / _128 / _192.  COMB_MACRO_ONLY=0 restores the all-spec average.
+COMB_MACRO_ONLY <- Sys.getenv("COMB_MACRO_ONLY", "1") == "1"
 TRAIL_DAYS   <- as.integer(Sys.getenv("TRAIL_DAYS",   "90"))
 TOP_N_SPECS  <- as.integer(Sys.getenv("TOP_N_SPECS",  "0"))  # 0 = ALL specs
 MIN_RESOLVED <- as.integer(Sys.getenv("MIN_RESOLVED", "30"))
@@ -376,7 +383,23 @@ run_country <- function(country) {
       specs <- grep("^spec_", names(mg), value = TRUE)
       specs <- specs[!grepl("__bc$", specs)]   # exclude bias-corrected twins
       if (length(specs) == 0L) next
-      Fm <- as.matrix(mg[, specs])
+      # members of the combinations: the specs with a monthly indicator
+      # (every individual spec in the file is still evaluated below)
+      comb_specs <- specs
+      if (COMB_MACRO_ONLY) {
+        dfp <- file.path(FORECAST_DIR, sprintf("%s_spec_dictionary_%s.csv", fam, cc))
+        if (file.exists(dfp)) {
+          dct <- read.csv(dfp, stringsAsFactors = FALSE)
+          macro_ids <- dct$spec_id[!is.na(dct$lf_vars) & dct$lf_vars != ""]
+          comb_specs <- specs[specs %in% macro_ids]
+          if (h == HORIZONS[1])
+            cat(sprintf("  %s: combinations over the %d specs with a monthly indicator (of %d in the file)\n",
+                        fam, length(comb_specs), length(specs)))
+        }
+      }
+      if (length(comb_specs) == 0L) next
+      Fm_all <- as.matrix(mg[, specs])          # for the individual evaluations
+      Fm <- Fm_all[, comb_specs, drop = FALSE]  # combination members
       y  <- mg$y_actual
       yb <- mg[[BENCH_COL]]
       td <- mg$target_date
@@ -404,7 +427,7 @@ run_country <- function(country) {
       # members' bias-corrected forecasts (renormalised over available bc
       # members).  Defines comb_*__bc consistently: corrected members,
       # identical weighting scheme, no look-ahead.
-      spec_bc_cols <- paste0(specs, "__bc")
+      spec_bc_cols <- paste0(comb_specs, "__bc")
       have_spec_bc <- all(spec_bc_cols %in% names(mg))
       Fbc <- if (have_spec_bc) as.matrix(mg[, spec_bc_cols]) else NULL
       comb_eq_bc   <- if (have_spec_bc) rowMeans(Fbc, na.rm = TRUE) else
@@ -461,7 +484,7 @@ run_country <- function(country) {
       # selection, hence no "_expost" flag).  TOP_N_SPECS = N > 0: only the
       # N best full-sample specs, labelled "_expost" because the ranking
       # uses the whole evaluation sample (look-ahead, disclose in the text).
-      full_rmse <- apply(Fm, 2, function(f) rmse_(f - y))
+      full_rmse <- apply(Fm_all, 2, function(f) rmse_(f - y))
       ord <- order(full_rmse)
       all_mode <- TOP_N_SPECS <= 0L || TOP_N_SPECS >= length(specs)
       sel_specs <- if (all_mode) specs else
@@ -487,7 +510,7 @@ run_country <- function(country) {
       desc      <- list()   # `variables` text of each model
       for (s in sel_specs) {
         lbl <- if (all_mode) s else paste0(s, "_expost")
-        models[[lbl]] <- Fm[, s]
+        models[[lbl]] <- Fm_all[, s]
         bc_col <- paste0(s, "__bc")
         models_bc[[lbl]] <- if (bc_col %in% names(mg)) mg[[bc_col]] else NULL
         desc[[lbl]] <- spec_desc[[s]]

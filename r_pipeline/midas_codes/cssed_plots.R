@@ -7,9 +7,10 @@
 #   1. ARX daily-only (ar_dum_gas_brent) vs AR benchmark
 #   2. real-time macro combination comb_invmse of each family (ARX, R_MIDAS,
 #      R_MIDAS_L7) vs AR benchmark
-#   3. each family's comb_invmse vs its OWN daily-only gas+brent twin
-#      (dashed: macro information alone, lag structure held fixed)
-#   4. R_MIDAS_L7 spec_000 (no macro) vs AR benchmark (lag-structure effect)
+#   3. [REPORT_TWINS=1 only] each family's comb_invmse vs its OWN daily-only
+#      gas+brent twin (dashed: macro information alone, lag structure fixed)
+#   4. R_MIDAS_L7 spec_000 (no macro) vs AR benchmark (lag-structure effect;
+#      absent in runs made with SPEC_REQUIRE_LF=1)
 # Subperiods shaded: pre <= 2020-12-31, crisis 2021-2022, post >= 2023.
 # Base graphics only.  Outputs: results/cssed/cssed_<cc>_h<hh>.png and
 # results/cssed/cssed_<cc>.csv (long: h, target_date, curve, value).
@@ -28,8 +29,11 @@ source(v2.boot.path)
 source(file.path(script_dir, "common_utils.R"))
 
 FORECAST_DIR <- file.path(script_dir, "forecasts")
-OUT_DIR      <- file.path(script_dir, "results", "cssed")
+OUT_DIR      <- file.path(script_dir, Sys.getenv("RESULT_SUBDIR", "results"), "cssed")
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+# twin curves (combination vs the family's own daily-only gas+brent spec) only
+# with REPORT_TWINS=1: absent under SPEC_REQUIRE_LF=1 and unused in the paper
+REPORT_TWINS <- Sys.getenv("REPORT_TWINS", "0") == "1"
 
 FAMS <- c(ARX = "arx", R_MIDAS = "r_midas", R_MIDAS_L7 = "r_midas_l7")
 COLS <- c(ARX = "#1b9e77", R_MIDAS = "#d95f02", R_MIDAS_L7 = "#7570b3")
@@ -68,7 +72,7 @@ run_country <- function(cc) {
       if ("comb_invmse" %in% names(cb)) {
         curves[[sprintf("%s comb_invmse vs AR", famlab)]] <-
           list(v = cssed(e_b, cb$comb_invmse - y), col = COLS[[famlab]], lty = 1, lwd = 2)
-        if (!is.na(twin_gb) && twin_gb %in% names(fc))
+        if (REPORT_TWINS && !is.na(twin_gb) && twin_gb %in% names(fc))
           curves[[sprintf("%s comb_invmse vs own gas+brent twin", famlab)]] <-
             list(v = cssed(fc[[twin_gb]] - y, cb$comb_invmse - y), col = COLS[[famlab]], lty = 2, lwd = 1.5)
       }

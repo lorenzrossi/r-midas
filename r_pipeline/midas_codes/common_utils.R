@@ -204,6 +204,31 @@ logscore_price <- function(y, point, s, a, b) {
   z <- (vst_z(y, a, b) - vst_z(point, a, b)) / s
   dnorm(z, log = TRUE) - log(s) + vst_logjac(y, a, b)
 }
+# Real-time rescaling of the h-step predictive sd (TODO_v4c, item 1).  The
+# model variance sigma2_h = sigma2 sum psi_s^2 ignores parameter uncertainty
+# and the regressors frozen at the origin; the realised h-step errors contain
+# both.  At origin t,  c2_t = sum u_tau^2 / sum sigma_tau^2  over the last R
+# origins tau whose target tau+h is <= t (resolved errors only), and
+# sigma~_t = c_t sigma_t.  u_tau = g(P_{tau+h}) - mu_tau on the transformed
+# scale with the (a, b) of origin tau.  NA with fewer than Rmin resolved
+# errors.  Rows must be ordered by origin date (so, for a fixed h, by target
+# date too).  The ratio c_t is returned as attr(, "c").
+recal_sigma <- function(point, sigma, a, b, y, od, td, R = 365L, Rmin = 180L) {
+  mu <- vst_z(point, a, b)
+  u  <- vst_z(y, a, b) - mu                        # h-step error, transformed scale
+  ok <- is.finite(u) & is.finite(sigma) & sigma > 0
+  e2 <- ifelse(ok, u^2, 0); s2 <- ifelse(ok, sigma^2, 0); n1 <- as.numeric(ok)
+  ce <- c(0, cumsum(e2)); cs <- c(0, cumsum(s2)); cn <- c(0, cumsum(n1))
+  j  <- findInterval(as.numeric(od), as.numeric(td))   # rows 1..j resolved at origin od
+  i0 <- pmax(0L, j - R)                                # window = rows (i0+1):j
+  n  <- cn[j + 1] - cn[i0 + 1]
+  c2 <- (ce[j + 1] - ce[i0 + 1]) / (cs[j + 1] - cs[i0 + 1])
+  cc <- sqrt(c2); cc[n < Rmin | !is.finite(cc)] <- NA_real_
+  out <- sigma * cc
+  out[!is.finite(out)] <- NA_real_
+  attr(out, "c") <- cc
+  out
+}
 # (a, b) of every rolling window ending at the given origins.
 vst_params_by_origin <- function(P, origins, window = WINDOW_DAYS) {
   a <- numeric(length(origins)); b <- a

@@ -22,8 +22,11 @@
 #   (logS_mean, CRPS_mean, share_in_90) when available.
 #   -> results/tests_vs_benchmark_<cc>.csv
 #      results/tests_l7_vs_benchmark_<cc>.csv  (R_MIDAS_L7 + its combinations)
+#   (RESULT_SUBDIR replaces "results")
 #
-# Table B — twin = specification of the SAME family with the same fuel set
+# Table B — ONLY WITH REPORT_TWINS=1 (default off since TODO_v4c item 0: the
+#   families are run with SPEC_REQUIRE_LF=1, so no daily-only twin exists).
+#   twin = specification of the SAME family with the same fuel set
 #   and no monthly indicator (nested; isolates the monthly information).
 #   Combinations are compared with the family's daily-only gas+brent spec.
 #   Same test columns, ratios "_vs_twin".
@@ -50,9 +53,13 @@ source(v2.boot.path)
 source(file.path(script_dir, "common_utils.R"))
 
 FORECAST_DIR <- file.path(script_dir, "forecasts")
-RESULT_DIR   <- file.path(script_dir, "results")
+RESULT_DIR   <- file.path(script_dir, Sys.getenv("RESULT_SUBDIR", "results"))
 dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
+# Table B (vs the daily-only twin) only with REPORT_TWINS=1: with
+# SPEC_REQUIRE_LF=1 (TODO_v4c item 0) the families hold no daily-only spec,
+# and the paper no longer uses twin comparisons.
+REPORT_TWINS <- Sys.getenv("REPORT_TWINS", "0") == "1"
 BENCH <- "ar_dum"
 FAM_FILES <- c(ARX = "arx", R_MIDAS = "r_midas", R_MIDAS_L7 = "r_midas_l7")
 PERIODS <- list(
@@ -161,7 +168,7 @@ run_country <- function(cc) {
       dict$hf_vars[is.na(dict$hf_vars)] <- ""; dict$lf_vars[is.na(dict$lf_vars)] <- ""
       specs <- dict$spec_id[dict$spec_id %in% names(fc)]
       tm <- twin_map(dict); tm <- tm[tm$spec_id %in% specs & tm$twin_id %in% specs, ]
-      twin_of <- setNames(tm$twin_id, tm$spec_id)
+      twin_of <- if (REPORT_TWINS) setNames(tm$twin_id, tm$spec_id) else character(0)
       Fm  <- as.matrix(fc[, specs, drop = FALSE])
       Fbc <- as.matrix(fc[, paste0(specs, "__bc"), drop = FALSE])
       res <- parallel_lapply(seq_along(specs), function(j) {
@@ -189,7 +196,7 @@ run_country <- function(cc) {
         cb <- read.csv(cfp, stringsAsFactors = FALSE)
         cb <- cb[match(key, paste(cb$origin_date, cb$target_date)), , drop = FALSE]
         twin_gb <- dict$spec_id[dict$hf_vars == "gas|brent" & dict$lf_vars == ""]
-        jt <- if (length(twin_gb)) match(twin_gb[1], specs) else NA
+        jt <- if (REPORT_TWINS && length(twin_gb)) match(twin_gb[1], specs) else NA
         for (m in intersect(c("comb_eq", "comb_trim", "comb_invmse_fam", "comb_invmse"), names(cb))) {
           base <- data.frame(country = cc, h = h, family = paste0("COMB_", famlab), model = m,
                              hf_vars = "comb", lf_vars = "comb", stringsAsFactors = FALSE)
@@ -205,7 +212,7 @@ run_country <- function(cc) {
     }
     cat(sprintf("  h=%02d done in %.0fs\n", h, as.numeric(difftime(Sys.time(), t0, units = "secs"))))
   }
-  A <- do.call(rbind, A_rows); B <- do.call(rbind, B_rows)
+  A <- do.call(rbind, A_rows); B <- if (length(B_rows)) do.call(rbind, B_rows) else NULL
   # density metrics of the same (h, period, family, model)
   if (!is.null(dens)) {
     dk <- dens[, c("h", "period", "family", "model", "logS_mean", "CRPS_mean", "share_in_90")]
@@ -221,14 +228,16 @@ run_country <- function(cc) {
     write.csv(B[B$family %in% c("R_MIDAS_L7", "COMB_R_MIDAS_L7"), ],
               file.path(RESULT_DIR, sprintf("tests_l7_vs_twin_%s.csv", cc)), row.names = FALSE)
   }
-  cat(sprintf("  wrote tests_vs_benchmark_%s.csv (%d rows), tests_vs_twin_%s.csv (%d rows)\n",
-              cc, nrow(A), cc, if (is.null(B)) 0L else nrow(B)))
+  cat(sprintf("  wrote tests_vs_benchmark_%s.csv (%d rows)%s\n", cc, nrow(A),
+              if (is.null(B)) " (no twin table: REPORT_TWINS=0 or no daily-only specs)" else
+                sprintf(", tests_vs_twin_%s.csv (%d rows)", cc, nrow(B))))
   list(A = A, B = B)
 }
 
 res <- lapply(eval_countries(), run_country)
-B <- do.call(rbind, lapply(res, `[[`, "B"))
-if (!is.null(B) && nrow(B)) {
+Bl <- Filter(Negate(is.null), lapply(res, `[[`, "B"))
+B <- if (length(Bl)) do.call(rbind, Bl) else NULL
+if (REPORT_TWINS && !is.null(B) && nrow(B)) {
   B <- B[grepl("^spec_", B$model), ]                  # macro specifications only
   indicators <- sort(unique(unlist(strsplit(B$lf_vars, "|", fixed = TRUE))))
   summ <- function(g) data.frame(

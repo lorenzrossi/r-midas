@@ -153,7 +153,8 @@ for (h in HORIZONS) {
   cat(sprintf("h=%02d done (%d modes)\n", h, length(SC)))
 }
 D <- do.call(rbind, rows); write.csv(D, file.path(OUT, sprintf("compare_vst_%s.csv", cc)), row.names = FALSE)
-if (length(trows)) { T_ <- do.call(rbind, trows); write.csv(T_, file.path(OUT, sprintf("compare_vst_tests_%s.csv", cc)), row.names = FALSE) }
+if (length(trows)) { cols <- unique(unlist(lapply(trows, names)))   # combos have no CRPS/logS columns: pad with NA
+  T_ <- do.call(rbind, lapply(trows, function(x) { x[setdiff(cols, names(x))] <- NA; x[cols] })); write.csv(T_, file.path(OUT, sprintf("compare_vst_tests_%s.csv", cc)), row.names = FALSE) }
 cat(sprintf("wrote %s (%d rows)\n", file.path(OUT, sprintf("compare_vst_%s.csv", cc)), nrow(D)))
 
 # console digest: full sample, ar_dum / ar_dum_gas / combos per mode

@@ -49,6 +49,8 @@ dir.create(COEF_DIR,     showWarnings = FALSE, recursive = TRUE)
 
 SPEC_LIMIT <- suppressWarnings(as.integer(Sys.getenv("SPEC_LIMIT", "256")))
 if (is.na(SPEC_LIMIT) || SPEC_LIMIT <= 0L) SPEC_LIMIT <- 256L
+SPEC_REQUIRE_LF <- suppressWarnings(as.integer(Sys.getenv("SPEC_REQUIRE_LF", "1")))
+if (is.na(SPEC_REQUIRE_LF)) SPEC_REQUIRE_LF <- 1L
 
 # -----------------------------------------------------------------------------
 # RUNNER
@@ -101,10 +103,18 @@ run_arx <- function(country) {
   masks <- masks[ord, , drop = FALSE]
   spec_ids <- sprintf("spec_%03d", 0:(nrow(masks) - 1L))
   rownames(masks) <- spec_ids
+  # SPEC_REQUIRE_LF=1 (default): only the specs with a monthly indicator, ids
+  # unchanged (see r_midas.R).
+  if (SPEC_REQUIRE_LF == 1L) {
+    keep_lf <- rowSums(masks[, lf_names, drop = FALSE]) > 0L
+    masks <- masks[keep_lf, , drop = FALSE]; spec_ids <- spec_ids[keep_lf]
+    cat(sprintf("  SPEC_REQUIRE_LF=1: %d specs with a monthly indicator (dropped %d daily-only)\n",
+                sum(keep_lf), sum(!keep_lf)))
+  }
   if (SPEC_LIMIT < nrow(masks)) {
     masks <- masks[1:SPEC_LIMIT, , drop = FALSE]
     spec_ids <- spec_ids[1:SPEC_LIMIT]
-    cat(sprintf("  SPEC_LIMIT=%d (truncating from 256)\n", SPEC_LIMIT))
+    cat(sprintf("  SPEC_LIMIT=%d (truncating)\n", SPEC_LIMIT))
   }
 
   dict <- data.frame(

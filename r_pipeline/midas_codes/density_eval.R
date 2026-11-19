@@ -37,25 +37,38 @@
 # Tests, per period (full / pre / crisis / post, >= max(30, 10h) obs):
 #   vs the AR benchmark ar_dum — DM-HLN (Amisano-Giacomini) and GW (2006)
 #     on the score differential, for every score;
-#   vs the DAILY-ONLY TWIN (same family, same fuel set, no monthly
-#     indicator) for every macro specification of ARX / R_MIDAS / R_MIDAS_L7
-#     — on logS and CRPS.
+#   [REPORT_TWINS=1 only] vs the DAILY-ONLY TWIN (same family, same fuel set,
+#     no monthly indicator) for every macro specification — on logS and CRPS.
+#     Off by default: with SPEC_REQUIRE_LF=1 (TODO_v4c item 0) the families
+#     contain no daily-only specification, so there is no twin.
 #   NEGATIVE dm statistic = model better (loss = -score); GW has no sign:
 #   gw_dbar < 0 = model better.
 #
+# PREDICTIVE-VARIANCE RESCALING (DENSITY_RECAL=1, TODO_v4c item 1): the model
+#   sd sigma_h,t is multiplied by c_h,t = sqrt(sum u^2 / sum sigma^2) over the
+#   last RECAL_WINDOW origins whose h-step error is resolved at t (target <=
+#   origin; at least RECAL_MIN of them, else NA) — recal_sigma() in
+#   common_utils.R.  The density stays Gaussian on the transformed scale; only
+#   its width changes.  The first ~h + RECAL_MIN origins drop out for EVERY
+#   model, benchmark included, so the tests compare the same days.  The
+#   uncorrected scores on the SAME days are kept as *_nocal columns and the
+#   median c per (family, h) is printed and written to recal_factor_<cc>.csv.
+#
 # INPUT : forecasts/<fam>_<cc>_h<h>.csv (+ _sd.csv), vst_params_<cc>.csv,
 #         <fam>_spec_dictionary_<cc>.csv
-# OUTPUT: results/density_scores_<cc>.csv          (h, family, model, period)
-#         results/density_tests_vs_twin_<cc>.csv   (macro spec vs twin)
-#         results/crps_summary_<cc>.csv            exact CRPS: ratio / skill vs
-#                                                  ar_dum, DM + GW, twin columns
-#         results/crps_twin_summary_<cc>.csv       median CRPS ratio vs twin and
-#                                                  share of macro specs with a
-#                                                  significantly lower CRPS,
-#                                                  overall and by indicator
-#         results/density_top5_per_country_h_<cc...>.csv  best 5 by logS
+# OUTPUT (in RESULT_SUBDIR, default results/):
+#         density_scores_<cc>.csv          (h, family, model, period)
+#         crps_summary_<cc>.csv            exact CRPS: ratio / skill vs ar_dum,
+#                                          DM + GW [+ twin columns]
+#         density_top5_per_country_h_<cc...>.csv  best 5 by logS
+#         recal_factor_<cc>.csv            median c_h,t per family and h
+#                                          (DENSITY_RECAL=1)
+#         density_tests_vs_twin_<cc>.csv, crps_twin_summary_<cc>.csv
+#                                          (REPORT_TWINS=1 only)
 # Env   : ACPS_C (default "0.05,0.25,0.5,0.75,0.95"), CRPS_K (1000),
-#         DENSITY_FAMILIES (default "ar,arx,r_midas,r_midas_l7"), COUNTRY_NAME.
+#         DENSITY_FAMILIES (default "ar,arx,r_midas,r_midas_l7"), COUNTRY_NAME,
+#         DENSITY_RECAL (0), RECAL_WINDOW (365), RECAL_MIN (180),
+#         RESULT_SUBDIR (results), REPORT_TWINS (0).
 # =============================================================================
 
 args <- commandArgs(trailingOnly = FALSE)
@@ -69,8 +82,13 @@ source(v2.boot.path)
 source(file.path(script_dir, "common_utils.R"))
 
 FORECAST_DIR <- file.path(script_dir, "forecasts")
-RESULT_DIR   <- file.path(script_dir, "results")
+RESULT_DIR   <- file.path(script_dir, Sys.getenv("RESULT_SUBDIR", "results"))
 dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+DENSITY_RECAL <- as.integer(Sys.getenv("DENSITY_RECAL", "0"))   # 1 = rescale sigma_h with past h-step errors
+RECAL_WINDOW  <- as.integer(Sys.getenv("RECAL_WINDOW", "365"))  # R   (origins)
+RECAL_MIN     <- as.integer(Sys.getenv("RECAL_MIN", "180"))     # R_min (resolved errors)
+REPORT_TWINS  <- Sys.getenv("REPORT_TWINS", "0") == "1"
 
 # ---- unit tests of the CRPS code: stop if wrong --------------------------------
 local({
@@ -81,6 +99,20 @@ local({
   stopifnot(abs(crps_quantile(95, log(60), .35, 0, 1) - crps_lnorm(95, log(60), .35)) < 1e-3)
   VST_MODE <<- old
   cat(sprintf("CRPS unit tests passed (K = %d); VST_MODE = %s\n", CRPS_K, VST_MODE))
+})
+# ---- unit test of the variance rescaling: true sd 2, model says 1 -> c ~ 2 ----
+if (DENSITY_RECAL == 1L) local({
+  old <- VST_MODE; VST_MODE <<- "level"; set.seed(1)
+  n <- 3000; od <- as.Date("2015-01-01") + 0:(n - 1); td <- od + 7
+  y <- rnorm(n, 0, 2); s <- rep(1, n)
+  st <- recal_sigma(rep(0, n), s, rep(0, n), rep(1, n), y, od, td, R = 365, Rmin = 180)
+  stopifnot(abs(median(st, na.rm = TRUE) - 2) < 0.1)
+  # burn-in: row k has k - h resolved errors (targets <= its origin), so the
+  # first Rmin + h - 1 = 186 rows are NA and row 187 is the first scored one
+  stopifnot(sum(is.na(st)) == 186L, all(is.na(st[1:186])), !is.na(st[187]))
+  VST_MODE <<- old
+  cat(sprintf("recal_sigma unit test passed (R = %d, Rmin = %d): median rescaled sd %.3f for true 2\n",
+              RECAL_WINDOW, RECAL_MIN, median(st, na.rm = TRUE)))
 })
 
 ACPS_C <- as.numeric(strsplit(Sys.getenv("ACPS_C", "0.05,0.25,0.5,0.75,0.95"), ",")[[1]])
@@ -154,20 +186,41 @@ integrate_scores <- function(mu, sigma, a, b, y, umin, umax) {
   list(scores = out, pit = P_y, z_y = z_y)
 }
 
-# Per-observation scores of one model: n x (SCORE_COLS, PIT).
+# Per-observation scores of one model: n x (SCORE_COLS, PIT [, *_nocal]).
 # point = MEDIAN forecast (the plain column, not __bc).
-score_block <- function(point, sigma, a, b, y, umin, umax) {
+# DENSITY_RECAL=1: sigma is first rescaled by recal_sigma() (rows must be in
+# origin order; od / td are the origin and target dates); the uncorrected
+# logS / CRPS / PIT of the same rows are kept in the *_nocal columns and the
+# median rescaling factor c in attr(S, "c_median").
+score_one <- function(mu, sigma, a, b, y, umin, umax, ok) {
+  r <- integrate_scores(mu[ok], sigma[ok], a[ok], b[ok], y[ok], umin, umax)
+  list(logS = dnorm(r$z_y, log = TRUE) - log(sigma[ok]) + vst_logjac(y[ok], a[ok], b[ok]),
+       trunc = r$scores,
+       CRPS = crps_exact(y[ok], mu[ok], sigma[ok], a[ok], b[ok]),
+       PIT = r$pit)
+}
+score_block <- function(point, sigma, a, b, y, umin, umax, od = NULL, td = NULL) {
   n <- length(y)
-  S <- matrix(NA_real_, n, length(SCORE_COLS) + 1L,
-              dimnames = list(NULL, c(SCORE_COLS, "PIT")))
+  nocal <- if (DENSITY_RECAL == 1L) c("logS_nocal", "CRPS_nocal", "PIT_nocal") else character(0)
+  S <- matrix(NA_real_, n, length(SCORE_COLS) + 1L + length(nocal),
+              dimnames = list(NULL, c(SCORE_COLS, "PIT", nocal)))
+  sigma0 <- sigma
+  if (DENSITY_RECAL == 1L) {
+    sigma <- recal_sigma(point, sigma, a, b, y, od, td, R = RECAL_WINDOW, Rmin = RECAL_MIN)
+    attr(S, "c_median") <- median(attr(sigma, "c"), na.rm = TRUE)
+  }
   mu <- vst_z(point, a, b)
   ok <- is.finite(mu) & is.finite(sigma) & sigma > 0 & is.finite(y) & is.finite(a) & is.finite(b)
   if (!any(ok)) return(S)
-  r <- integrate_scores(mu[ok], sigma[ok], a[ok], b[ok], y[ok], umin, umax)
-  S[ok, "logS"] <- dnorm(r$z_y, log = TRUE) - log(sigma[ok]) + vst_logjac(y[ok], a[ok], b[ok])
-  S[ok, colnames(r$scores)] <- r$scores
-  S[ok, "CRPS"] <- crps_exact(y[ok], mu[ok], sigma[ok], a[ok], b[ok])
-  S[ok, "PIT"]  <- r$pit
+  r <- score_one(mu, sigma, a, b, y, umin, umax, ok)
+  S[ok, "logS"] <- r$logS
+  S[ok, colnames(r$trunc)] <- r$trunc
+  S[ok, "CRPS"] <- r$CRPS
+  S[ok, "PIT"]  <- r$PIT
+  if (DENSITY_RECAL == 1L) {                     # uncorrected scores on the SAME rows
+    r0 <- score_one(mu, sigma0, a, b, y, umin, umax, ok)
+    S[ok, "logS_nocal"] <- r0$logS; S[ok, "CRPS_nocal"] <- r0$CRPS; S[ok, "PIT_nocal"] <- r0$PIT
+  }
   S
 }
 
@@ -181,6 +234,12 @@ period_rows <- function(S, S_ref, td, h, base, with_pit = TRUE, scores = SCORE_C
     if (n_ok < 5L) next
     n_min <- max(30L, 10L * h)
     row <- cbind(base, data.frame(period = pn, n = n_ok, stringsAsFactors = FALSE))
+    if (with_pit && "logS_nocal" %in% colnames(S)) {   # uncorrected densities, same days
+      row$logS_nocal_mean <- mean(S[ok, "logS_nocal"])
+      row$CRPS_nocal_mean <- mean(S[ok, "CRPS_nocal"])
+      pit0 <- S[ok, "PIT_nocal"]
+      row$pit_sd_nocal <- sd(pit0); row$share_in_90_nocal <- mean(pit0 > 0.05 & pit0 < 0.95)
+    }
     for (sc in scores) {
       sign_ <- if (sc %in% LOSS_COLS) 1 else -1              # loss = -score
       row[[paste0(sc, "_mean")]]  <- mean(S[ok, sc])
@@ -237,7 +296,7 @@ run_country <- function(cc) {
   cat(sprintf("  ACPS / CRPS_trunc range [%g, %g] euros/MWh; c = %s\n",
               umin, umax, paste(ACPS_C, collapse = ", ")))
 
-  rows <- list(); twin_rows <- list(); n_viol <- 0L; n_tot <- 0L
+  rows <- list(); twin_rows <- list(); c_rows <- list(); n_viol <- 0L; n_tot <- 0L
   for (h in HORIZONS) {
     ar_fp <- file.path(FORECAST_DIR, sprintf("ar_%s_h%02d.csv", cc, h))
     ar_sd <- file.path(FORECAST_DIR, sprintf("ar_%s_h%02d_sd.csv", cc, h))
@@ -245,12 +304,17 @@ run_country <- function(cc) {
     ar  <- read.csv(ar_fp, stringsAsFactors = FALSE)
     ars <- read.csv(ar_sd, stringsAsFactors = FALSE)
     ar$target_date <- as.Date(ar$target_date)
+    ar  <- ar[order(as.Date(ar$origin_date)), , drop = FALSE]   # origin order (recal_sigma needs it)
     key <- paste(ar$origin_date, ar$target_date)
     ars <- ars[match(key, paste(ars$origin_date, ars$target_date)), , drop = FALSE]
     y   <- ar$y_actual
     td  <- ar$target_date
+    od  <- as.Date(ar$origin_date)
     vp  <- load_vst_params(FORECAST_DIR, cc, ar$origin_date)
-    S_bench <- score_block(ar[[BENCH]], ars[[BENCH]], vp$a, vp$b, y, umin, umax)
+    S_bench <- score_block(ar[[BENCH]], ars[[BENCH]], vp$a, vp$b, y, umin, umax, od = od, td = td)
+    if (DENSITY_RECAL == 1L)
+      cat(sprintf("  h=%02d benchmark: median c = %.3f, %d of %d rows scored after the burn-in\n",
+                  h, attr(S_bench, "c_median"), sum(is.finite(S_bench[, "logS"])), length(y)))
 
     for (fam in FAMS) {
       fp <- file.path(FORECAST_DIR, sprintf("%s_%s_h%02d.csv", fam, cc, h))
@@ -267,8 +331,13 @@ run_country <- function(cc) {
       rm(fc, fcs)
       t_start <- Sys.time()
       S_all <- parallel_lapply(seq_along(models), function(j)
-        score_block(Fm[, j], Sm[, j], vp$a, vp$b, y, umin, umax))
+        score_block(Fm[, j], Sm[, j], vp$a, vp$b, y, umin, umax, od = od, td = td))
       names(S_all) <- models
+      if (DENSITY_RECAL == 1L) {
+        cm <- vapply(S_all, function(S) { v <- attr(S, "c_median"); if (is.null(v)) NA_real_ else v }, numeric(1))
+        c_rows[[length(c_rows) + 1L]] <- data.frame(country = cc, h = h, family = FAM_LABEL[[fam]],
+                                                    model = models, c_median = cm, stringsAsFactors = FALSE)
+      }
       # the exact CRPS adds the tails, so it cannot fall below the truncated
       # one beyond the integration noise of the trapezoid rule (~2e-4
       # relative) and of the K-point quantile rule
@@ -297,7 +366,7 @@ run_country <- function(cc) {
                                lf_vars = if (!is.null(dict)) dict$lf_vars[match(m, dict$spec_id)] else NA_character_,
                                stringsAsFactors = FALSE)))
       rows[[length(rows) + 1L]] <- do.call(rbind, blocks)
-      if (!is.null(dict)) {
+      if (REPORT_TWINS && !is.null(dict)) {
         tm <- twin_map(dict)
         tm <- tm[tm$spec_id %in% models & tm$twin_id %in% models, , drop = FALSE]
         tb <- lapply(seq_len(nrow(tm)), function(i)
@@ -318,11 +387,32 @@ run_country <- function(cc) {
   df <- do.call(rbind, rows)
   names(df) <- sub("_ref$", "_bench", names(df))
   df$acps_umin <- umin; df$acps_umax <- umax; df$vst_mode <- VST_MODE
+  df$density_recal <- DENSITY_RECAL
+  if (DENSITY_RECAL == 1L) {
+    df$recal_window <- RECAL_WINDOW; df$recal_min <- RECAL_MIN
+    CF <- do.call(rbind, c_rows)
+    outf <- file.path(RESULT_DIR, sprintf("recal_factor_%s.csv", cc))
+    write.csv(CF, outf, row.names = FALSE)
+    cat(sprintf("  wrote %s  (rows = %d)\n", outf, nrow(CF)))
+    cat("\n  median rescaling factor c (over origins, then over the models of the family; > 1 = model densities too narrow):\n")
+    cat(sprintf("    %-10s %s\n", "family", paste(sprintf("h=%02d", HORIZONS), collapse = "   ")))
+    for (fam in unique(CF$family)) {
+      v <- vapply(HORIZONS, function(h) { g <- CF$c_median[CF$family == fam & CF$h == h]
+        if (length(g)) median(g, na.rm = TRUE) else NA_real_ }, numeric(1))
+      cat(sprintf("    %-10s %s\n", fam, paste(sprintf("%.3f", v), collapse = "  ")))
+    }
+    # with gas / monthly indicators vs without
+    if (any(grepl("^spec_", CF$model))) {
+      cat("    (AR models: ", paste(sprintf("%s %.3f", CF$model[CF$family == "AR" & CF$h == max(HORIZONS)],
+                                            CF$c_median[CF$family == "AR" & CF$h == max(HORIZONS)]), collapse = ", "),
+          " at h = ", max(HORIZONS), ")\n", sep = "")
+    }
+  }
   out <- file.path(RESULT_DIR, sprintf("density_scores_%s.csv", cc))
   write.csv(df, out, row.names = FALSE)
   cat(sprintf("  wrote %s  (rows = %d)\n", out, nrow(df)))
   tw <- NULL
-  if (length(twin_rows)) {
+  if (REPORT_TWINS && length(twin_rows)) {
     tw <- do.call(rbind, twin_rows)
     names(tw) <- sub("_ref$", "_twin", names(tw))
     outt <- file.path(RESULT_DIR, sprintf("density_tests_vs_twin_%s.csv", cc))
@@ -340,6 +430,11 @@ run_country <- function(cc) {
                  "pit_sd", "share_in_90", "pit_ks_pval")
   cs$crps_ratio <- cs$crps_mean / cs$crps_bench
   cs$crps_skill <- 1 - cs$crps_ratio
+  if (DENSITY_RECAL == 1L) {                     # uncorrected densities on the same days
+    cs$crps_nocal_mean <- df$CRPS_nocal_mean; cs$logS_nocal_mean <- df$logS_nocal_mean
+    cs$pit_sd_nocal <- df$pit_sd_nocal; cs$share_in_90_nocal <- df$share_in_90_nocal
+    cs$logS_mean <- df$logS_mean
+  }
   if (!is.null(tw)) {
     tt <- tw[, c("h", "period", "family", "model", "twin", "CRPS_twin",
                  "CRPS_dm_stat", "CRPS_dm_pval", "CRPS_gw_stat", "CRPS_gw_pval", "CRPS_gw_dbar")]
@@ -393,6 +488,16 @@ run_country <- function(cc) {
     cat(sprintf("    h=%02d %-10s %-18s logS %+.4f (p=%.3f)  CRPS %.2f ratio %.3f  cov90 %.2f\n",
                 h, fam, g$model, g$logS_diff, g$logS_dm_pval,
                 g$CRPS_mean, g$CRPS_mean / g$CRPS_bench, g$share_in_90))
+  }
+  if (DENSITY_RECAL == 1L) {
+    cat("\n  benchmark ar_dum, full sample, rescaled vs uncorrected on the SAME days (logS | CRPS | cov90 | PIT sd):\n")
+    for (h in HORIZONS) {
+      g <- full[full$h == h & full$model == BENCH, ]
+      if (!nrow(g)) next
+      cat(sprintf("    h=%02d  rescaled %.4f | %.3f | %.3f | %.4f    uncorrected %.4f | %.3f | %.3f | %.4f\n",
+                  h, g$logS_mean, g$CRPS_mean, g$share_in_90, g$pit_sd,
+                  g$logS_nocal_mean, g$CRPS_nocal_mean, g$share_in_90_nocal, g$pit_sd_nocal))
+    }
   }
   df
 }

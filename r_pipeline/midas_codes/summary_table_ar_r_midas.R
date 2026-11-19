@@ -41,7 +41,7 @@ if (!file.exists(cu)) {
 source(cu)
 
 FORECAST_DIR <- file.path(data_root, "forecasts")
-RESULT_DIR   <- file.path(data_root, "results")
+RESULT_DIR   <- file.path(data_root, Sys.getenv("RESULT_SUBDIR", "results"))
 dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 .rmse_block <- function(e_t, e_b, h) {

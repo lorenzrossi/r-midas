@@ -36,10 +36,16 @@
 #   STAGES="ar,r_midas,summary" Rscript run_all.R
 #
 # Knobs: COUNTRY_NAME ("Germany" | "Italy" | "ALL"), N_CORES, SPEC_LIMIT,
-# WINDOW_DAYS, VST_MODE (normalized | raw), LF_IT_SURVEY (iesi_it |
-# istat_bci_it), RMIDAS_THETA2_MAX (8 = theta2 free, 0 = old restriction),
-# RMIDAS_DISCOUNT, RMIDAS_HUBER, FAMILIES (combination stage; default = the
-# families whose estimation stages are in the run).
+# WINDOW_DAYS, VST_MODE (normalized | asinh | log | level), LF_IT_SURVEY
+# (iesi_it | istat_bci_it), RMIDAS_THETA2_MAX (8 = theta2 free, 0 = old
+# restriction), RMIDAS_DISCOUNT, RMIDAS_HUBER, FAMILIES (combination stage;
+# default = the families whose estimation stages are in the run).
+# TODO_v4c knobs: SPEC_REQUIRE_LF (1 = only the 252 specs with a monthly
+# indicator), COMB_MACRO_ONLY (1 = combinations over those specs only),
+# DENSITY_RECAL / RECAL_WINDOW / RECAL_MIN (real-time rescaling of the
+# predictive sd in the density stage), RESULT_SUBDIR (output folder of the
+# evaluation stages, default "results"), REPORT_TWINS (1 = keep the old
+# "vs daily-only twin" tables).
 # =============================================================================
 
 args <- commandArgs(trailingOnly = FALSE)
@@ -88,6 +94,10 @@ cat(sprintf("settings: VST_MODE=%s LF_IT_SURVEY=%s RMIDAS_THETA2_MAX=%s WINDOW_D
             Sys.getenv("VST_MODE", "normalized"), Sys.getenv("LF_IT_SURVEY", "iesi_it"),
             Sys.getenv("RMIDAS_THETA2_MAX", "8"), Sys.getenv("WINDOW_DAYS", "3650"),
             Sys.getenv("N_CORES", "auto"), Sys.getenv("FAMILIES", families_default)))
+cat(sprintf("          SPEC_REQUIRE_LF=%s COMB_MACRO_ONLY=%s DENSITY_RECAL=%s RECAL_WINDOW=%s RECAL_MIN=%s RESULT_SUBDIR=%s REPORT_TWINS=%s\n",
+            Sys.getenv("SPEC_REQUIRE_LF", "1"), Sys.getenv("COMB_MACRO_ONLY", "1"),
+            Sys.getenv("DENSITY_RECAL", "0"), Sys.getenv("RECAL_WINDOW", "365"), Sys.getenv("RECAL_MIN", "180"),
+            Sys.getenv("RESULT_SUBDIR", "results"), Sys.getenv("REPORT_TWINS", "0")))
 
 failed <- character(0)
 for (st in order) {
